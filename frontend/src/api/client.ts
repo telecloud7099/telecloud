@@ -57,7 +57,11 @@ async function apiFetch(url: string, options: RequestInit = {}, signal?: AbortSi
   const res = await fetch(url, { ...options, headers, signal })
 
   if (res.status === 401) {
-    window.location.href = '/login'
+    // Don't redirect if already on an auth page — avoids an infinite reload loop
+    // (Login calls /me to check auth; a 401 there is the expected answer, not an error)
+    if (!['/login', '/setup'].includes(window.location.pathname)) {
+      window.location.href = '/login'
+    }
     throw new Error('Unauthorized')
   }
   if (res.status === 403) {
