@@ -18,13 +18,17 @@ from backend.routes import folders as folders_router
 
 load_dotenv()
 
-_log_handler = logging.handlers.RotatingFileHandler(
-    "app.log", maxBytes=5 * 1024 * 1024, backupCount=3
-)
+_log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+if os.getenv("LOG_TO_FILE"):
+    _log_handlers.append(
+        logging.handlers.RotatingFileHandler(
+            "app.log", maxBytes=5 * 1024 * 1024, backupCount=3
+        )
+    )
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    handlers=[_log_handler, logging.StreamHandler()],
+    handlers=_log_handlers,
 )
 logger = logging.getLogger(__name__)
 
@@ -76,6 +80,11 @@ async def error_middleware(request: Request, call_next):
     except Exception as e:
         logger.error(f"Unhandled error in {request.method} {request.url.path}: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error"})
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 app.include_router(auth_router.router)

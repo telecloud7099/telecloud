@@ -1,3 +1,6 @@
+// ── API base URL (set VITE_API_URL on Vercel to point at Railway backend) ─────
+const API_BASE = (import.meta.env.VITE_API_URL as string | undefined) ?? ''
+
 // ── Token storage ─────────────────────────────────────────────────────────────
 
 const TOKEN_KEY = 'tc_access_token'
@@ -72,7 +75,7 @@ async function apiFetch(url: string, options: RequestInit = {}, signal?: AbortSi
     headers.set('Authorization', `Bearer ${token}`)
   }
 
-  const res = await fetch(url, { ...options, headers, signal })
+  const res = await fetch(`${API_BASE}${url}`, { ...options, headers, signal })
 
   if (res.status === 401) {
     clearToken()
@@ -111,35 +114,35 @@ function del(url: string, body?: unknown) {
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 export const checkPhone = (phone: string) =>
-  fetch('/check-phone', {
+  fetch(`${API_BASE}/check-phone`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ phone }),
   }).then(r => r.json()) as Promise<{ status: string; needs_setup: boolean }>
 
 export const setupApi = (phone: string, apiId: string, apiHash: string) =>
-  fetch('/setup-api', {
+  fetch(`${API_BASE}/setup-api`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ phone, api_id: Number(apiId), api_hash: apiHash }),
   }).then(r => r.json())
 
 export const sendCode = (phone: string) =>
-  fetch('/send_code', {
+  fetch(`${API_BASE}/send_code`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ phone }),
   }).then(r => r.json())
 
 export const verifyCode = (phone: string, code: string) =>
-  fetch('/verify_code', {
+  fetch(`${API_BASE}/verify_code`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ phone, code }),
   }).then(r => r.json())
 
 export const verifyPassword = (phone: string, password: string) =>
-  fetch('/verify_password', {
+  fetch(`${API_BASE}/verify_password`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ phone, password }),
@@ -191,11 +194,11 @@ export const fileUrl = (id: number, download = false) => {
   const token = getToken()
   const params = new URLSearchParams({ token })
   if (download) params.set('download', 'true')
-  return `/file/${id}?${params}`
+  return `${API_BASE}/file/${id}?${params}`
 }
 
 export const thumbnailUrl = (id: number) =>
-  `/thumbnail/${id}?token=${encodeURIComponent(getToken())}`
+  `${API_BASE}/thumbnail/${id}?token=${encodeURIComponent(getToken())}`
 
 export const moveFiles = (folder: string, msgIds: number[]) =>
   post('/files/move', { folder, msg_ids: msgIds })
