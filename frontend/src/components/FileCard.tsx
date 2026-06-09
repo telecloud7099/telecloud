@@ -30,6 +30,8 @@ function FileCard({ file, selected, onToggle, onOpenGallery, onOpenPreview }: Pr
   const isAudio = file.mime_type.startsWith('audio/')
   const isPdf = file.mime_type.includes('pdf')
   const canPreview = isVideo || isAudio || isPdf
+  // Both images and videos get thumbnail attempts (backend serves video poster frames too)
+  const wantsThumb = isImage || isVideo
 
   function handleClick() {
     if (isImage && onOpenGallery) onOpenGallery()
@@ -55,7 +57,7 @@ function FileCard({ file, selected, onToggle, onOpenGallery, onOpenPreview }: Pr
       </button>
 
       <div className="file-thumb">
-        {isImage && !thumbError && visible ? (
+        {wantsThumb && !thumbError && visible ? (
           <img
             src={thumbnailUrl(file.id)}
             alt=""

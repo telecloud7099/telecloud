@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
+const BACKEND = process.env.VITE_API_URL || 'http://127.0.0.1:8000'
+
 export default defineConfig({
   plugins: [react()],
   base: '/',
@@ -11,18 +13,19 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/me': 'http://127.0.0.1:5001',
-      '/logout': 'http://127.0.0.1:5001',
-      '/setup-api': 'http://127.0.0.1:5001',
-      '/send_code': 'http://127.0.0.1:5001',
-      '/verify_code': 'http://127.0.0.1:5001',
-      '/verify_password': 'http://127.0.0.1:5001',
-      '/folders': 'http://127.0.0.1:5001',
-      '/files': 'http://127.0.0.1:5001',
-      '/file': 'http://127.0.0.1:5001',
-      '/thumbnail': 'http://127.0.0.1:5001',
-      '/upload': 'http://127.0.0.1:5001',
-      '/delete_data': 'http://127.0.0.1:5001',
+      '/me': BACKEND,
+      '/logout': BACKEND,
+      '/check-phone': BACKEND,
+      '/setup-api': BACKEND,
+      '/send_code': BACKEND,
+      '/verify_code': BACKEND,
+      '/verify_password': BACKEND,
+      '/delete_data': BACKEND,
+      '/folders': BACKEND,
+      '/files': BACKEND,
+      '/file': BACKEND,
+      '/thumbnail': BACKEND,
+      '/upload': BACKEND,
     },
   },
 })

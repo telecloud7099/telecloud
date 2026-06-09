@@ -1,3 +1,19 @@
+// ── Token storage ─────────────────────────────────────────────────────────────
+
+const TOKEN_KEY = 'tc_access_token'
+
+export function getToken(): string {
+  return localStorage.getItem(TOKEN_KEY) ?? ''
+}
+
+export function setToken(token: string) {
+  localStorage.setItem(TOKEN_KEY, token)
+}
+
+export function clearToken() {
+  localStorage.removeItem(TOKEN_KEY)
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export interface Folder {
@@ -11,7 +27,9 @@ export interface TeleFile {
   size: number
   mime_type: string
   date: string | null
-  caption?: string
+  category?: string
+  folder_id?: string | null
+  folder_name?: string | null
 }
 
 export interface FilesResponse {
@@ -40,33 +58,28 @@ export interface StatsResponse {
 
 export interface MeResponse {
   status: string
-  phone: string
-  has_api_credentials: boolean
+  telegram_user_id: number
+  username: string | null
+  first_name: string | null
 }
 
 // ── Core fetch ───────────────────────────────────────────────────────────────
 
-function getCsrf(): string {
-  return document.cookie.split(';').map(c => c.trim()).find(c => c.startsWith('csrf_token='))?.split('=')[1] ?? ''
-}
-
 async function apiFetch(url: string, options: RequestInit = {}, signal?: AbortSignal): Promise<Response> {
   const headers = new Headers(options.headers)
-  headers.set('X-CSRF-Token', getCsrf())
+  const token = getToken()
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`)
+  }
 
   const res = await fetch(url, { ...options, headers, signal })
 
   if (res.status === 401) {
-    // Don't redirect if already on an auth page — avoids an infinite reload loop
-    // (Login calls /me to check auth; a 401 there is the expected answer, not an error)
+    clearToken()
     if (!['/login', '/setup'].includes(window.location.pathname)) {
       window.location.href = '/login'
     }
     throw new Error('Unauthorized')
-  }
-  if (res.status === 403) {
-    window.location.reload()
-    throw new Error('CSRF mismatch')
   }
   return res
 }
@@ -97,25 +110,46 @@ function del(url: string, body?: unknown) {
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
-export const checkSetup = () => fetch('/has-setup').then(r => r.json()) as Promise<{ configured: boolean }>
+export const checkPhone = (phone: string) =>
+  fetch('/check-phone', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone }),
+  }).then(r => r.json()) as Promise<{ status: string; needs_setup: boolean }>
 
-export const setupApi = (apiId: string, apiHash: string) =>
-  post('/setup-api', { api_id: apiId, api_hash: apiHash })
+export const setupApi = (phone: string, apiId: string, apiHash: string) =>
+  fetch('/setup-api', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone, api_id: Number(apiId), api_hash: apiHash }),
+  }).then(r => r.json())
 
 export const sendCode = (phone: string) =>
-  post('/send_code', { phone })
+  fetch('/send_code', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone }),
+  }).then(r => r.json())
 
-export const verifyCode = (phone: string, code: string, phoneCodeHash: string) =>
-  post('/verify_code', { phone, code, phone_code_hash: phoneCodeHash })
+export const verifyCode = (phone: string, code: string) =>
+  fetch('/verify_code', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone, code }),
+  }).then(r => r.json())
 
 export const verifyPassword = (phone: string, password: string) =>
-  post('/verify_password', { phone, password })
+  fetch('/verify_password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ phone, password }),
+  }).then(r => r.json())
 
 export const getMe = () => apiFetch('/me')
 
-export const logout = () => post('/logout', {})
+export const logout = () => apiFetch('/logout', { method: 'POST' })
 
-export const deleteData = () => del('/delete_data')
+export const deleteData = () => apiFetch('/delete_data', { method: 'POST' })
 
 // ── Folders ──────────────────────────────────────────────────────────────────
 
@@ -148,15 +182,20 @@ export const listFiles = (params: { offset?: number; limit?: number; category?: 
 
 export const getFileStats = () => apiFetch('/files/stats')
 
-export const syncFiles = () => post('/files/sync', {})
+export const syncFiles = () => apiFetch('/files/sync', { method: 'POST' })
 
 export const searchFiles = (q: string) =>
   apiFetch(`/files/search?q=${encodeURIComponent(q)}`)
 
-export const fileUrl = (id: number, download = false) =>
-  `/file/${id}${download ? '?download=true' : ''}`
+export const fileUrl = (id: number, download = false) => {
+  const token = getToken()
+  const params = new URLSearchParams({ token })
+  if (download) params.set('download', 'true')
+  return `/file/${id}?${params}`
+}
 
-export const thumbnailUrl = (id: number) => `/thumbnail/${id}`
+export const thumbnailUrl = (id: number) =>
+  `/thumbnail/${id}?token=${encodeURIComponent(getToken())}`
 
 export const moveFiles = (folder: string, msgIds: number[]) =>
   post('/files/move', { folder, msg_ids: msgIds })
@@ -172,7 +211,8 @@ export const uploadFiles = (folder: string, files: File[], onProgress?: (pct: nu
 
     const xhr = new XMLHttpRequest()
     xhr.open('POST', '/upload')
-    xhr.setRequestHeader('X-CSRF-Token', getCsrf())
+    const token = getToken()
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
 
     if (onProgress) {
       xhr.upload.onprogress = e => {

@@ -1,52 +1,64 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { sendCode, verifyCode, verifyPassword, checkSetup, getMe } from '../api/client'
+import { useNavigate, useLocation } from 'react-router-dom'
+import { checkPhone, sendCode, verifyCode, verifyPassword, getMe, setToken } from '../api/client'
 import { useStore } from '../store'
 
 type Step = 'phone' | 'code' | 'password'
 
 const STEP_CONFIG: Record<Step, { index: number; title: string; subtitle: (phone?: string) => string }> = {
-  phone:    { index: 0, title: 'Sign in',              subtitle: () => 'Enter your Telegram phone number' },
-  code:     { index: 1, title: 'Verify code',          subtitle: (p) => `Code sent to ${p}` },
+  phone:    { index: 0, title: 'Sign in',               subtitle: () => 'Enter your Telegram phone number' },
+  code:     { index: 1, title: 'Verify code',           subtitle: (p) => `Code sent to ${p}` },
   password: { index: 2, title: 'Two-step verification', subtitle: () => 'Enter your Telegram cloud password' },
 }
 
 export default function Login() {
   const nav = useNavigate()
-  const setPhone = useStore(s => s.setPhone)
+  const location = useLocation()
+  const setDisplayName = useStore(s => s.setPhone)
 
-  const [step, setStep] = useState<Step>('phone')
-  const [phone, setPhoneInput] = useState('')
+  const locationState = location.state as { phone?: string; step?: Step } | null
+  const [step, setStep] = useState<Step>(locationState?.step ?? 'phone')
+  const [phone, setPhoneInput] = useState(locationState?.phone ?? '')
   const [code, setCode] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {
-    getMe().then(r => r.json()).then(d => {
-      if (d.status === 'success') nav('/dashboard', { replace: true })
-      else checkSetup().then(s => { if (!s.configured) nav('/setup') })
-    }).catch(() => checkSetup().then(s => { if (!s.configured) nav('/setup') }))
+    // Already have a valid JWT → skip to dashboard
+    getMe()
+      .then(r => r.json())
+      .then(d => { if (d.status === 'success') nav('/dashboard', { replace: true }) })
+      .catch(() => {/* no token yet, stay on login */})
   }, [])
 
   async function submitPhone(e: React.FormEvent) {
     e.preventDefault()
     setError('')
     setLoading(true)
+    const trimmed = phone.trim()
     try {
-      const res = await sendCode(phone.trim())
-      const d = await res.json()
-      if (d.status === 'code_sent') {
-        setStep('code')
-      } else if (d.setup_url) {
-        nav('/setup')
-      } else {
-        setError(d.message || 'Failed to send code')
+      const d = await checkPhone(trimmed)
+      if (d.needs_setup) {
+        nav('/setup', { state: { phone: trimmed } })
+        return
       }
+      await doSendCode(trimmed)
     } catch {
       setError('Network error')
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function doSendCode(ph: string) {
+    const d = await sendCode(ph)
+    if (d.status === 'code_sent') {
+      setStep('code')
+    } else if (d.needs_setup) {
+      nav('/setup', { state: { phone: ph } })
+    } else {
+      setError(d.message || 'Failed to send code')
     }
   }
 
@@ -55,10 +67,10 @@ export default function Login() {
     setError('')
     setLoading(true)
     try {
-      const res = await verifyCode(phone.trim(), code.trim(), '')
-      const d = await res.json()
+      const d = await verifyCode(phone.trim(), code.trim())
       if (d.status === 'success') {
-        setPhone(phone.trim())
+        setToken(d.access_token)
+        setDisplayName(phone.trim())
         nav('/dashboard')
       } else if (d.status === '2fa_required') {
         setStep('password')
@@ -77,13 +89,13 @@ export default function Login() {
     setError('')
     setLoading(true)
     try {
-      const res = await verifyPassword(phone.trim(), password)
-      const d = await res.json()
+      const d = await verifyPassword(phone.trim(), password)
       if (d.status === 'success') {
-        setPhone(phone.trim())
+        setToken(d.access_token)
+        setDisplayName(phone.trim())
         nav('/dashboard')
       } else {
-        setError(d.message || 'Wrong password')
+        setError(d.error || d.message || 'Wrong password')
       }
     } catch {
       setError('Network error')
@@ -98,13 +110,11 @@ export default function Login() {
     <div className="auth-container">
       <div className="auth-card">
 
-        {/* Logo */}
         <div className="auth-logo">
           <span className="material-symbols-rounded" style={{ fontSize: '2.5rem', color: 'var(--accent)' }}>cloud</span>
           <h1 className="auth-title">TeleCloud</h1>
         </div>
 
-        {/* Step dots */}
         <div className="step-dots">
           {(['phone', 'code', 'password'] as Step[]).map((s, i) => (
             <div
@@ -119,13 +129,11 @@ export default function Login() {
           ))}
         </div>
 
-        {/* Title */}
         <div className="auth-step-header">
           <div className="auth-step-title">{cfg.title}</div>
           <div className="auth-step-subtitle">{cfg.subtitle(phone)}</div>
         </div>
 
-        {/* Phone step */}
         {step === 'phone' && (
           <form onSubmit={submitPhone} className="auth-form">
             <div className="form-group">
@@ -143,14 +151,13 @@ export default function Login() {
             {error && <div className="auth-error">{error}</div>}
             <button className="btn btn-primary btn-block" type="submit" disabled={loading}>
               {loading
-                ? <><span className="material-symbols-rounded spin" style={{ fontSize: '1rem' }}>progress_activity</span> Sending…</>
-                : 'Send Code'
+                ? <><span className="material-symbols-rounded spin" style={{ fontSize: '1rem' }}>progress_activity</span> Checking…</>
+                : 'Continue'
               }
             </button>
           </form>
         )}
 
-        {/* Code step */}
         {step === 'code' && (
           <form onSubmit={submitCode} className="auth-form">
             <div className="form-group">
@@ -184,7 +191,6 @@ export default function Login() {
           </form>
         )}
 
-        {/* 2FA step */}
         {step === 'password' && (
           <form onSubmit={submitPassword} className="auth-form">
             <div className="form-group">

@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { setupApi, checkSetup } from '../api/client'
+import { useState } from 'react'
+import { useNavigate, useLocation } from 'react-router-dom'
+import { setupApi, sendCode } from '../api/client'
 
 const STEPS = [
   { n: 1, text: 'Open my.telegram.org and sign in with your phone number' },
@@ -11,24 +11,32 @@ const STEPS = [
 
 export default function Setup() {
   const nav = useNavigate()
+  const location = useLocation()
+  const phone: string = (location.state as { phone?: string })?.phone ?? ''
+
   const [apiId, setApiId] = useState('')
   const [apiHash, setApiHash] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
-  useEffect(() => {
-    checkSetup().then(d => { if (d.configured) nav('/login') })
-  }, [])
-
   async function submit(e: React.FormEvent) {
     e.preventDefault()
+    if (!phone) {
+      setError('Phone number missing. Please go back to login.')
+      return
+    }
     setError('')
     setLoading(true)
     try {
-      const res = await setupApi(apiId.trim(), apiHash.trim())
-      const d = await res.json()
+      const d = await setupApi(phone, apiId.trim(), apiHash.trim())
       if (d.status === 'success') {
-        nav('/login')
+        // Immediately trigger OTP now that credentials are stored
+        const codeRes = await sendCode(phone)
+        if (codeRes.status === 'code_sent') {
+          nav('/login', { state: { phone, step: 'code' }, replace: true })
+        } else {
+          setError(codeRes.message || 'Failed to send OTP after setup')
+        }
       } else {
         setError(d.message || 'Setup failed')
       }
@@ -43,14 +51,18 @@ export default function Setup() {
     <div className="auth-container">
       <div className="auth-card setup-card">
 
-        {/* Header */}
         <div className="auth-logo">
           <span className="material-symbols-rounded" style={{ fontSize: '2.5rem', color: 'var(--accent)' }}>cloud</span>
           <h1 className="auth-title">TeleCloud</h1>
           <p className="auth-subtitle">One-time setup — connect to your Telegram account</p>
         </div>
 
-        {/* Instructions */}
+        {phone && (
+          <div style={{ textAlign: 'center', marginBottom: '0.5rem', color: 'var(--text-muted)', fontSize: '0.875rem' }}>
+            Setting up for <strong>{phone}</strong>
+          </div>
+        )}
+
         <div className="setup-guide">
           <div className="setup-guide-header">
             <span className="material-symbols-rounded">help_outline</span>
@@ -75,7 +87,6 @@ export default function Setup() {
           </a>
         </div>
 
-        {/* Form */}
         <form onSubmit={submit} className="auth-form">
           <div className="form-group">
             <label className="form-label">API ID</label>
@@ -109,6 +120,13 @@ export default function Setup() {
               ? <><span className="material-symbols-rounded spin" style={{ fontSize: '1rem' }}>progress_activity</span> Saving…</>
               : 'Save & Continue'
             }
+          </button>
+          <button
+            type="button"
+            className="btn btn-ghost btn-block"
+            onClick={() => nav('/login')}
+          >
+            ← Back to login
           </button>
         </form>
 

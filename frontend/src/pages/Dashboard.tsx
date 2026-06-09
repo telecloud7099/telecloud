@@ -5,7 +5,7 @@ import { useStore } from '../store'
 import {
   getMe, logout, listFolders, getFolderCounts, listFiles,
   listFilesInFolder, getFileStats, createFolder,
-  moveFiles, deleteFiles, syncFiles,
+  moveFiles, deleteFiles, syncFiles, clearToken,
 } from '../api/client'
 import type { TeleFile } from '../api/client'
 import FolderGrid from '../components/FolderGrid'
@@ -49,6 +49,8 @@ export default function Dashboard() {
   const [totalSize, setTotalSize] = useState(0)
   const [foldersLoading, setFoldersLoading] = useState(true)
   const [scanWarning, setScanWarning] = useState(false)
+  const [bgSyncing, setBgSyncing] = useState(false)
+  const bgSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const [newFolderName, setNewFolderName] = useState('')
   const [showNewFolder, setShowNewFolder] = useState(false)
   const [category, setCategory] = useState<Category>('All')
@@ -67,7 +69,7 @@ export default function Dashboard() {
       .then(r => r.json())
       .then(d => {
         if (d.status !== 'success') { nav('/login'); return }
-        setPhone(d.phone)
+        setPhone(d.first_name || d.username || String(d.telegram_user_id))
       })
       .catch(() => nav('/login'))
 
@@ -76,20 +78,22 @@ export default function Dashboard() {
     loadAllFiles(true)
   }, [])
 
-  // ── Auto-poll every 60s for new Telegram files ────────────────────────────
+  // ── Sync on tab focus (visibility change) ────────────────────────────────
   useEffect(() => {
-    const id = setInterval(async () => {
+    const handleVisibility = async () => {
+      if (document.visibilityState !== 'visible') return
       try {
         const res = await syncFiles()
         const d = await res.json()
         if (d.new_files > 0) {
-          toast.success(`${d.new_files} new file${d.new_files !== 1 ? 's' : ''} synced from Telegram`)
+          toast.success(`${d.new_files} new file${d.new_files !== 1 ? 's' : ''} synced`)
           loadAllFiles(true)
           loadFolders()
         }
-      } catch { /* silent background poll */ }
-    }, 60000)
-    return () => clearInterval(id)
+      } catch { /* silent */ }
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    return () => document.removeEventListener('visibilitychange', handleVisibility)
   }, [])
 
   // ── Manual sync ───────────────────────────────────────────────────────────
@@ -161,6 +165,17 @@ export default function Dashboard() {
         if (reset) setFiles(d.files); else appendFiles(d.files)
         setHasMore(d.has_more)
         setOffset(off + d.files.length)
+        if (d.syncing) {
+          setBgSyncing(true)
+          if (bgSyncTimerRef.current) clearTimeout(bgSyncTimerRef.current)
+          bgSyncTimerRef.current = setTimeout(() => {
+            setBgSyncing(false)
+            loadAllFiles(true)
+            loadFolders()
+          }, 8000)
+        } else {
+          setBgSyncing(false)
+        }
       } else {
         toast.error(d.message || 'Failed to load files')
       }
@@ -204,19 +219,21 @@ export default function Dashboard() {
   function openAllFiles() {
     cancelPending()
     clearSelection()
-    setFiles([])
     setOffset(0)
     setView('all')
-    loadAllFiles(true)
+    // Don't clear files before loading — keeps the grid populated during transition
+    // loadAllFiles will replace them when the response arrives
+    loadAllFiles(false)
   }
 
-  // Re-load when category changes in All view
+  // Re-load when category changes while in All view
   useEffect(() => {
     if (view === 'all') {
       setFiles([])
       setOffset(0)
       loadAllFiles(true)
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [category])
 
   // ── Create folder ─────────────────────────────────────────────────────────
@@ -296,9 +313,10 @@ export default function Dashboard() {
   }
 
   // ── Logout ────────────────────────────────────────────────────────────────
-  async function handleLogout() {
-    await logout()
+  function handleLogout() {
+    clearToken()
     nav('/login')
+    logout().catch(() => {}) // fire-and-forget; Telegram disconnect runs in background
   }
 
   const showingFiles = view === 'all' || view === 'folder' || view === 'search'
@@ -362,6 +380,14 @@ export default function Dashboard() {
               <div className="scan-warning">
                 <span className="material-symbols-rounded">warning</span>
                 Only the most recent {scanLimit.toLocaleString()} messages were scanned. Older files may not appear.
+              </div>
+            )}
+
+            {/* Background sync banner */}
+            {bgSyncing && (
+              <div className="scan-warning" style={{ background: 'rgba(var(--accent-rgb,99,102,241),0.12)', borderColor: 'var(--accent)' }}>
+                <span className="material-symbols-rounded" style={{ animation: 'spin 1s linear infinite' }}>sync</span>
+                Scanning your Telegram files for the first time. Files will appear shortly…
               </div>
             )}
 

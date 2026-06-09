@@ -1,22 +1,24 @@
 import os
 import uuid
-import hashlib
 import asyncio
 import logging
 import time as _time
+from datetime import datetime
 from typing import AsyncIterator, Optional
 from fastapi import APIRouter, Request, Depends, UploadFile, File, Form, Query
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel
-from fastapi.concurrency import run_in_threadpool
 
-from backend.auth import get_current_user, check_csrf
-from backend.database import get_api_credentials, add_folder
-from backend.telegram_client import get_client
-from backend.cache import cache_get, cache_set, cache_invalidate
-from backend.security import (
-    rate_limit_check, validate_file_upload, sanitize_input, log_security_event,
+from backend.auth import get_current_user, get_media_user
+from backend.database import (
+    get_api_credentials, load_string_session,
+    db_get_files, db_upsert_files, db_insert_file, db_delete_files_by_ids,
+    db_move_files, get_sync_state, update_sync_state,
+    add_folder, get_folder_by_name, folder_exists,
 )
+from backend.telegram_client import get_client, get_string_session, remove_client, is_client_connected
+from backend.cache import cache_get, cache_set, cache_invalidate
+from backend.security import rate_limit_check, validate_file_upload, sanitize_input, log_security_event
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -26,8 +28,35 @@ THUMB_FOLDER = "thumbs"
 PAGE_SIZE = 50
 MAX_SCAN_MESSAGES = int(os.getenv("MAX_SCAN_MESSAGES", "2000") or "2000")
 
+# Tracks users currently undergoing a background full scan
+_syncing_users: set[int] = set()
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(THUMB_FOLDER, exist_ok=True)
+
+
+def _make_name(raw_name: str | None, mime: str, msg_id: int, date=None) -> str:
+    if raw_name:
+        return raw_name
+    # Generate a readable name from MIME type and date/ID
+    ts = ""
+    if date:
+        try:
+            ts = "_" + date.strftime("%Y%m%d_%H%M%S")
+        except Exception:
+            ts = f"_{msg_id}"
+    else:
+        ts = f"_{msg_id}"
+    if mime.startswith("image/"):
+        ext = mime.split("/")[-1].split(";")[0] or "jpg"
+        return f"photo{ts}.{ext}"
+    if mime.startswith("video/"):
+        ext = mime.split("/")[-1].split(";")[0] or "mp4"
+        return f"video{ts}.{ext}"
+    if mime.startswith("audio/"):
+        ext = mime.split("/")[-1].split(";")[0] or "mp3"
+        return f"audio{ts}.{ext}"
+    return f"file{ts}"
 
 
 def _categorize(name: str, mime: str) -> str:
@@ -48,16 +77,24 @@ def _categorize(name: str, mime: str) -> str:
     return "Other"
 
 
-def _get_creds(request: Request):
-    sid = request.cookies.get("tc_api_session")
-    return get_api_credentials(sid)
+async def _get_telegram_client(telegram_user_id: int, require_authorized: bool = False):
+    api_id, api_hash = get_api_credentials(telegram_user_id)
+    if not api_id:
+        raise Exception("API credentials not found")
+    string_session = load_string_session(telegram_user_id) or ""
+    client = await get_client(telegram_user_id, api_id, api_hash, string_session, require_authorized)
+    # Only persist StringSession if it changed (saves a DB write on every call)
+    saved = get_string_session(telegram_user_id)
+    if saved and saved != string_session:
+        from backend.database import save_string_session
+        save_string_session(telegram_user_id, saved)
+    return client
 
 
-# ── Cache-backed scan helpers ─────────────────────────────────────────────────
+# ── Sync helpers ──────────────────────────────────────────────────────────────
 
-async def _full_scan(phone: str, api_id: int, api_hash: str) -> list[dict]:
-    from backend.database import db_save_files, update_sync_state
-    client = await get_client(phone, api_id, api_hash, require_authorized=True)
+async def _full_scan(telegram_user_id: int) -> list[dict]:
+    client = await _get_telegram_client(telegram_user_id, require_authorized=True)
     max_scan = None if MAX_SCAN_MESSAGES == 0 else MAX_SCAN_MESSAGES
     files = []
     seen: set[int] = set()
@@ -68,8 +105,8 @@ async def _full_scan(phone: str, api_id: int, api_hash: str) -> list[dict]:
         seen.add(msg.id)
         if msg.id > newest_id:
             newest_id = msg.id
-        name = msg.file.name or f"file_{msg.id}"
         mime = msg.file.mime_type or "application/octet-stream"
+        name = _make_name(msg.file.name, mime, msg.id, msg.date)
         files.append({
             "id": msg.id, "name": name,
             "size": msg.file.size or 0, "mime_type": mime,
@@ -78,20 +115,17 @@ async def _full_scan(phone: str, api_id: int, api_hash: str) -> list[dict]:
             "caption": (msg.text or "").strip(),
         })
     files.sort(key=lambda x: x.get("date") or "", reverse=True)
-    db_save_files(phone, files)
-    update_sync_state(phone, last_sync_at=_time.time(), newest_msg_id=newest_id)
-    return files
+    db_upsert_files(telegram_user_id, files)
+    update_sync_state(telegram_user_id, last_sync_at=_time.time(), newest_msg_id=newest_id)
+    return db_get_files(telegram_user_id)
 
 
-async def _incremental_sync(phone: str, api_id: int, api_hash: str, force: bool = False):
-    from backend.database import (
-        db_get_files, db_upsert_files, get_sync_state, update_sync_state
-    )
-    state = get_sync_state(phone)
+async def _incremental_sync(telegram_user_id: int, force: bool = False) -> int:
+    state = get_sync_state(telegram_user_id)
     if not force and _time.time() - state["last_sync_at"] < 600:
         return 0
     try:
-        client = await get_client(phone, api_id, api_hash, require_authorized=True)
+        client = await _get_telegram_client(telegram_user_id, require_authorized=True)
         min_id = state["newest_msg_id"]
         new_files = []
         newest_id = min_id
@@ -100,8 +134,8 @@ async def _incremental_sync(phone: str, api_id: int, api_hash: str, force: bool 
                 continue
             if msg.id > newest_id:
                 newest_id = msg.id
-            name = msg.file.name or f"file_{msg.id}"
             mime = msg.file.mime_type or "application/octet-stream"
+            name = _make_name(msg.file.name, mime, msg.id, msg.date)
             new_files.append({
                 "id": msg.id, "name": name,
                 "size": msg.file.size or 0, "mime_type": mime,
@@ -110,15 +144,25 @@ async def _incremental_sync(phone: str, api_id: int, api_hash: str, force: bool 
                 "caption": (msg.text or "").strip(),
             })
         if new_files:
-            db_upsert_files(phone, new_files)
-            all_files = db_get_files(phone)
-            all_files.sort(key=lambda x: x.get("date") or "", reverse=True)
-            cache_set(f"{phone}:all_files", all_files)
-        update_sync_state(phone, last_sync_at=_time.time(), newest_msg_id=newest_id)
+            db_upsert_files(telegram_user_id, new_files)
+            all_files = db_get_files(telegram_user_id)
+            cache_set(f"{telegram_user_id}:all_files", all_files)
+        update_sync_state(telegram_user_id, last_sync_at=_time.time(), newest_msg_id=newest_id)
         return len(new_files)
     except Exception as e:
-        logger.error(f"Incremental sync error for {phone}: {e}")
+        logger.error(f"Incremental sync error for user {telegram_user_id}: {e}")
         return 0
+
+
+async def _warm_client(telegram_user_id: int):
+    """Connect Telegram client in background so thumbnails load immediately."""
+    if is_client_connected(telegram_user_id):
+        return
+    try:
+        await _get_telegram_client(telegram_user_id, require_authorized=True)
+        logger.info(f"Telegram client warmed for user {telegram_user_id}")
+    except Exception as e:
+        logger.debug(f"Telegram client warm-up failed for user {telegram_user_id}: {e}")
 
 
 # ── List all files ────────────────────────────────────────────────────────────
@@ -130,40 +174,45 @@ async def list_all_files(
     limit: int = Query(PAGE_SIZE),
     category: str = Query("All"),
     refresh: bool = Query(False),
-    phone: str = Depends(get_current_user),
+    telegram_user_id: int = Depends(get_current_user),
 ):
     rl = await rate_limit_check(request)
     if rl:
         return rl
 
-    api_id, api_hash = _get_creds(request)
-    if not api_id:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "API credentials missing"})
-
-    cache_key = f"{phone}:all_files"
+    cache_key = f"{telegram_user_id}:all_files"
     if refresh:
-        cache_invalidate(phone)
+        cache_invalidate(str(telegram_user_id))
 
     all_files = cache_get(cache_key)
 
     if all_files is None:
-        # Try DB first — instant load, no Telegram call
-        from backend.database import db_get_files, get_sync_state
-        db_files = db_get_files(phone)
-        if db_files:
-            all_files = sorted(db_files, key=lambda x: x.get("date") or "", reverse=True)
-            cache_set(cache_key, all_files)
-            # Kick off incremental sync in background (non-blocking)
-            asyncio.create_task(_incremental_sync(phone, api_id, api_hash))
-        else:
-            # First ever use — must do full scan (blocks until done)
-            all_files = await _full_scan(phone, api_id, api_hash)
-            cache_set(cache_key, all_files)
+        db_files = db_get_files(telegram_user_id)
+        all_files = db_files or []
+        cache_set(cache_key, all_files)
+        if not db_files:
+            if telegram_user_id not in _syncing_users:
+                _syncing_users.add(telegram_user_id)
+                async def _bg_scan(uid: int = telegram_user_id):
+                    try:
+                        await _full_scan(uid)
+                        refreshed = db_get_files(uid)
+                        cache_set(f"{uid}:all_files", refreshed)
+                        logger.info(f"Background full scan complete for user {uid}: {len(refreshed)} files")
+                    except Exception as e:
+                        logger.error(f"Background full scan error for user {uid}: {e}")
+                    finally:
+                        _syncing_users.discard(uid)
+                asyncio.create_task(_bg_scan())
+
+    syncing = telegram_user_id in _syncing_users
+
+    # Warm up Telegram client in background so thumbnails can load without waiting
+    asyncio.create_task(_warm_client(telegram_user_id))
 
     filtered = [f for f in all_files if f.get("category") == category] if category != "All" else all_files
     page = filtered[offset: offset + limit]
 
-    log_security_event(request, "ALL_FILES_LISTED", f"offset={offset} cat={category}", phone)
     return {
         "status": "success",
         "files": page,
@@ -171,17 +220,15 @@ async def list_all_files(
         "has_more": offset + limit < len(filtered),
         "scan_limit": MAX_SCAN_MESSAGES,
         "scanned": len(all_files),
+        "syncing": syncing,
     }
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 @router.get("/files/stats")
-async def files_stats(
-    request: Request,
-    phone: str = Depends(get_current_user),
-):
-    cache_key = f"{phone}:all_files"
+async def files_stats(telegram_user_id: int = Depends(get_current_user)):
+    cache_key = f"{telegram_user_id}:all_files"
     all_files = cache_get(cache_key)
     scanned = len(all_files) if all_files is not None else None
     has_more = (scanned == MAX_SCAN_MESSAGES) if scanned is not None else None
@@ -194,17 +241,14 @@ async def files_stats(
     }
 
 
-# ── Manual / auto sync ───────────────────────────────────────────────────────
+# ── Manual sync ───────────────────────────────────────────────────────────────
 
 @router.post("/files/sync")
 async def sync_new_files(
     request: Request,
-    phone: str = Depends(get_current_user),
+    telegram_user_id: int = Depends(get_current_user),
 ):
-    api_id, api_hash = _get_creds(request)
-    if not api_id:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "API credentials missing"})
-    new_count = await _incremental_sync(phone, api_id, api_hash, force=True)
+    new_count = await _incremental_sync(telegram_user_id, force=True)
     return {"status": "success", "new_files": new_count}
 
 
@@ -214,7 +258,7 @@ async def sync_new_files(
 async def search_files(
     request: Request,
     q: str = Query(""),
-    phone: str = Depends(get_current_user),
+    telegram_user_id: int = Depends(get_current_user),
 ):
     rl = await rate_limit_check(request)
     if rl:
@@ -224,58 +268,22 @@ async def search_files(
     if len(query) < 2:
         return JSONResponse(status_code=400, content={"status": "error", "message": "Query must be at least 2 characters"})
 
-    api_id, api_hash = _get_creds(request)
-    if not api_id:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "API credentials missing"})
-
-    cache_key = f"{phone}:all_files"
-    all_files = cache_get(cache_key)
-
-    if all_files is None:
-        # warm the cache via the list endpoint logic
-        client = await get_client(phone, api_id, api_hash, require_authorized=True)
-        files = []
-        seen: set[int] = set()
-        max_scan = None if MAX_SCAN_MESSAGES == 0 else MAX_SCAN_MESSAGES
-        async for msg in client.iter_messages("me", limit=max_scan):
-            if not msg or not msg.file or msg.id in seen:
-                continue
-            seen.add(msg.id)
-            name = msg.file.name or f"file_{msg.id}"
-            mime = msg.file.mime_type or "application/octet-stream"
-            files.append({
-                "id": msg.id,
-                "name": name,
-                "size": msg.file.size or 0,
-                "mime_type": mime,
-                "date": msg.date.isoformat() if msg.date else None,
-                "category": _categorize(name, mime),
-                "caption": (msg.text or "").strip(),
-            })
-        files.sort(key=lambda x: x.get("date") or "", reverse=True)
-        all_files = files
-        cache_set(cache_key, all_files)
-
+    all_files = cache_get(f"{telegram_user_id}:all_files") or db_get_files(telegram_user_id)
     results = [f for f in all_files if query in (f.get("name") or "").lower()]
-    log_security_event(request, "FILES_SEARCHED", f"q={query} found={len(results)}", phone)
     return {"status": "success", "files": results[:200], "total": len(results), "query": query}
 
 
-# ── Stream file with Range support ───────────────────────────────────────────
+# ── Stream file ───────────────────────────────────────────────────────────────
 
 @router.get("/file/{msg_id}")
 async def get_file(
     msg_id: int,
     request: Request,
     download: bool = Query(False),
-    phone: str = Depends(get_current_user),
+    telegram_user_id: int = Depends(get_media_user),
 ):
-    api_id, api_hash = _get_creds(request)
-    if not api_id:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "API credentials missing"})
-
     try:
-        client = await get_client(phone, api_id, api_hash, require_authorized=True)
+        client = await _get_telegram_client(telegram_user_id, require_authorized=True)
         message = await client.get_messages("me", ids=msg_id)
         if not message or not message.file:
             return JSONResponse(status_code=404, content={"status": "error", "message": "File not found"})
@@ -283,12 +291,9 @@ async def get_file(
         mime = message.file.mime_type or "application/octet-stream"
         name = message.file.name or f"file_{msg_id}"
         file_size = message.file.size or 0
-
-        # Disposition: inline for preview, attachment for download
         disposition = "attachment" if download else "inline"
         safe_name = name.replace('"', '_').replace('\r', '').replace('\n', '')
 
-        # Handle Range requests for video/audio seeking
         range_header = request.headers.get("Range")
         if range_header and file_size:
             try:
@@ -311,9 +316,8 @@ async def get_file(
                 }
                 return StreamingResponse(range_iter(), status_code=206, media_type=mime, headers=headers)
             except Exception as e:
-                logger.warning(f"Range parse error: {e}, falling back to full stream")
+                logger.warning(f"Range parse error: {e}")
 
-        # Full file stream
         async def full_iter() -> AsyncIterator[bytes]:
             async for chunk in client.iter_download(message.media):
                 yield chunk
@@ -327,12 +331,10 @@ async def get_file(
         if file_size:
             headers["Content-Length"] = str(file_size)
 
-        # ETag 304 check
         if request.headers.get("If-None-Match") == f'"{msg_id}"':
             return Response(status_code=304)
 
         return StreamingResponse(full_iter(), media_type=mime, headers=headers)
-
     except Exception as e:
         logger.error(f"GET FILE ERROR: {e}")
         return JSONResponse(status_code=404, content={"status": "error", "message": "File not found"})
@@ -344,40 +346,38 @@ async def get_file(
 async def get_thumbnail(
     msg_id: int,
     request: Request,
-    phone: str = Depends(get_current_user),
+    telegram_user_id: int = Depends(get_media_user),
 ):
-    phone_hash = hashlib.sha256(phone.encode()).hexdigest()[:16]
-    thumb_file = f"{phone_hash}_{msg_id}.jpg"
+    thumb_file = f"{telegram_user_id}_{msg_id}.jpg"
     thumb_path = os.path.join(os.path.abspath(THUMB_FOLDER), thumb_file)
 
     if os.path.exists(thumb_path):
         from fastapi.responses import FileResponse
         return FileResponse(thumb_path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
 
-    api_id, api_hash = _get_creds(request)
-    if not api_id:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "API credentials missing"})
-
     try:
-        client = await get_client(phone, api_id, api_hash, require_authorized=True)
+        client = await _get_telegram_client(telegram_user_id, require_authorized=True)
         message = await client.get_messages("me", ids=msg_id)
         if not message or not message.file:
             return JSONResponse(status_code=404, content={"status": "error", "message": "Not found"})
 
         thumb_bytes = None
 
+        # Documents (videos, files with poster frames) — use largest available thumb
         if message.document and getattr(message.document, "thumbs", None):
             try:
-                thumb_bytes = await message.download_media(bytes, thumb=0)
+                thumb_bytes = await message.download_media(bytes, thumb=-1)
             except Exception:
                 pass
 
+        # Telegram native photos
         if not thumb_bytes and message.photo:
             try:
-                thumb_bytes = await message.download_media(bytes, thumb=0)
+                thumb_bytes = await message.download_media(bytes, thumb=-1)
             except Exception:
                 pass
 
+        # Small images: download full file as thumb
         if not thumb_bytes:
             mime = message.file.mime_type or ""
             if mime.startswith("image/") and message.file.size and message.file.size < 500_000:
@@ -389,11 +389,8 @@ async def get_thumbnail(
         with open(thumb_path, "wb") as f:
             f.write(thumb_bytes)
 
-        return Response(
-            content=thumb_bytes,
-            media_type="image/jpeg",
-            headers={"Cache-Control": "public, max-age=604800"},
-        )
+        return Response(content=thumb_bytes, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=604800"})
     except Exception as e:
         logger.error(f"GET THUMBNAIL ERROR: {e}")
         return JSONResponse(status_code=404, content={"status": "error", "message": "Not found"})
@@ -406,16 +403,11 @@ async def upload(
     request: Request,
     folderName: str = Form(default=""),
     file: list[UploadFile] = File(...),
-    phone: str = Depends(get_current_user),
+    telegram_user_id: int = Depends(get_current_user),
 ):
     rl = await rate_limit_check(request)
     if rl:
         return rl
-    check_csrf(request)
-
-    api_id, api_hash = _get_creds(request)
-    if not api_id:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "API credentials missing"})
 
     folder_name = sanitize_input(folderName)
     files = file
@@ -428,7 +420,6 @@ async def upload(
         if not ok:
             return JSONResponse(status_code=400, content={"status": "error", "message": result})
 
-    # Save temp files
     saved: list[tuple[str, str]] = []
     for f in files:
         filename = f"{uuid.uuid4().hex}_{f.filename}"
@@ -438,14 +429,32 @@ async def upload(
             fp.write(content)
         saved.append((f.filename, path))
 
+    # Resolve folder_id upfront
+    folder_id = None
+    if folder_name:
+        folder = add_folder(telegram_user_id, folder_name)
+        folder_id = folder.id
+
     uploaded: list[str] = []
     failed: list[str] = []
 
     try:
-        client = await get_client(phone, api_id, api_hash, require_authorized=True)
+        client = await _get_telegram_client(telegram_user_id, require_authorized=True)
         for orig_name, path in saved:
             try:
-                await client.send_file("me", path, caption=folder_name or "", force_document=True)
+                msg = await client.send_file("me", path, force_document=True)
+                mime = msg.file.mime_type or "application/octet-stream" if msg.file else "application/octet-stream"
+                size = msg.file.size or 0 if msg.file else 0
+                db_insert_file(
+                    telegram_user_id=telegram_user_id,
+                    msg_id=msg.id,
+                    filename=orig_name,
+                    mime_type=mime,
+                    file_size=size,
+                    category=_categorize(orig_name, mime),
+                    uploaded_at=msg.date if msg.date else datetime.utcnow(),
+                    folder_id=folder_id,
+                )
                 uploaded.append(orig_name)
             except Exception as e:
                 logger.error(f"Error uploading {orig_name}: {e}")
@@ -454,28 +463,18 @@ async def upload(
                 if os.path.exists(path):
                     os.remove(path)
     except Exception as e:
-        # Clean up any remaining temp files on total failure
         for _, path in saved:
             if os.path.exists(path):
                 os.remove(path)
         logger.error(f"UPLOAD ERROR: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": "Upload failed"})
 
-    if folder_name:
-        add_folder(phone, folder_name)
-
-    cache_invalidate(phone)
-    from backend.database import db_clear_files
-    db_clear_files(phone)
-    log_security_event(request, "FILES_UPLOADED", f"uploaded={len(uploaded)} failed={len(failed)}", phone)
+    cache_invalidate(str(telegram_user_id))
+    log_security_event(request, "FILES_UPLOADED", f"uploaded={len(uploaded)} failed={len(failed)}", str(telegram_user_id))
 
     if failed:
-        return {
-            "status": "partial",
-            "uploaded": uploaded,
-            "failed": failed,
-            "message": f"{len(uploaded)} uploaded, {len(failed)} failed.",
-        }
+        return {"status": "partial", "uploaded": uploaded, "failed": failed,
+                "message": f"{len(uploaded)} uploaded, {len(failed)} failed."}
     return {"status": "success", "files": uploaded}
 
 
@@ -490,16 +489,11 @@ class MoveFilesBody(BaseModel):
 async def move_files(
     request: Request,
     body: MoveFilesBody,
-    phone: str = Depends(get_current_user),
+    telegram_user_id: int = Depends(get_current_user),
 ):
     rl = await rate_limit_check(request)
     if rl:
         return rl
-    check_csrf(request)
-
-    api_id, api_hash = _get_creds(request)
-    if not api_id:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "API credentials missing"})
 
     folder = sanitize_input(body.folder).strip()
     if not folder:
@@ -507,30 +501,11 @@ async def move_files(
     if not body.msg_ids:
         return JSONResponse(status_code=400, content={"status": "error", "message": "msg_ids must be a non-empty list"})
 
-    try:
-        client = await get_client(phone, api_id, api_hash, require_authorized=True)
-
-        async def edit_one(mid: int) -> Optional[int]:
-            try:
-                await client.edit_message("me", mid, folder)
-                return None
-            except Exception as e:
-                logger.error(f"MOVE FILE ERROR msg_id={mid}: {e}")
-                return mid
-
-        results = await asyncio.gather(*[edit_one(mid) for mid in body.msg_ids])
-        failed = [r for r in results if r is not None]
-        moved = len(body.msg_ids) - len(failed)
-
-        add_folder(phone, folder)
-        cache_invalidate(phone)
-        from backend.database import db_clear_files
-        db_clear_files(phone)
-        log_security_event(request, "FILES_MOVED", f"moved={moved} to={folder}", phone)
-        return {"status": "success", "moved": moved, "failed": failed}
-    except Exception as e:
-        logger.error(f"MOVE FILES ERROR: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to move files"})
+    target_folder = add_folder(telegram_user_id, folder)
+    db_move_files(telegram_user_id, body.msg_ids, target_folder.id)
+    cache_invalidate(str(telegram_user_id))
+    log_security_event(request, "FILES_MOVED", f"moved={len(body.msg_ids)} to={folder}", str(telegram_user_id))
+    return {"status": "success", "moved": len(body.msg_ids), "failed": []}
 
 
 # ── Delete files ──────────────────────────────────────────────────────────────
@@ -543,22 +518,17 @@ class DeleteFilesBody(BaseModel):
 async def delete_files(
     request: Request,
     body: DeleteFilesBody,
-    phone: str = Depends(get_current_user),
+    telegram_user_id: int = Depends(get_current_user),
 ):
     rl = await rate_limit_check(request)
     if rl:
         return rl
-    check_csrf(request)
-
-    api_id, api_hash = _get_creds(request)
-    if not api_id:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "API credentials missing"})
 
     if not body.msg_ids:
         return JSONResponse(status_code=400, content={"status": "error", "message": "msg_ids must be a non-empty list"})
 
     try:
-        client = await get_client(phone, api_id, api_hash, require_authorized=True)
+        client = await _get_telegram_client(telegram_user_id, require_authorized=True)
         deleted, failed = 0, []
         for i in range(0, len(body.msg_ids), 100):
             chunk = body.msg_ids[i: i + 100]
@@ -569,17 +539,15 @@ async def delete_files(
                 logger.error(f"DELETE chunk error: {e}")
                 failed.extend(chunk)
 
-        # Remove cached thumbnails
-        phone_hash = hashlib.sha256(phone.encode()).hexdigest()[:16]
+        db_delete_files_by_ids(telegram_user_id, body.msg_ids)
+
         for mid in body.msg_ids:
-            tp = os.path.join(THUMB_FOLDER, f"{phone_hash}_{mid}.jpg")
+            tp = os.path.join(THUMB_FOLDER, f"{telegram_user_id}_{mid}.jpg")
             if os.path.exists(tp):
                 os.remove(tp)
 
-        cache_invalidate(phone)
-        from backend.database import db_clear_files
-        db_clear_files(phone)
-        log_security_event(request, "FILES_DELETED", f"deleted={deleted}", phone)
+        cache_invalidate(str(telegram_user_id))
+        log_security_event(request, "FILES_DELETED", f"deleted={deleted}", str(telegram_user_id))
         return {"status": "success", "deleted": deleted, "failed": failed}
     except Exception as e:
         logger.error(f"DELETE FILES ERROR: {e}")
