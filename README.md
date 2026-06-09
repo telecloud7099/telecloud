@@ -2,45 +2,50 @@
 
 **Your Telegram "Saved Messages" as a personal cloud drive.**
 
-TeleCloud turns Telegram's unlimited Saved Messages storage into a proper file manager — folders, drag-and-drop uploads, image gallery, video previews with seeking, and search — all running locally on your machine. Your files live in *your* Telegram account; TeleCloud is just a beautiful window into them.
+TeleCloud turns Telegram's unlimited Saved Messages storage into a proper file manager — folders, drag-and-drop uploads, image gallery, video/audio previews with seeking, and search — all running on your machine. Your files live in *your* Telegram account; TeleCloud is just a beautiful window into them.
 
-![Stack](https://img.shields.io/badge/backend-FastAPI-009688) ![Stack](https://img.shields.io/badge/frontend-React%2019%20%2B%20TypeScript-61dafb) ![Stack](https://img.shields.io/badge/db-SQLite-003B57) ![Stack](https://img.shields.io/badge/telegram-Telethon-2AABEE)
+![Backend](https://img.shields.io/badge/backend-FastAPI-009688)
+![Frontend](https://img.shields.io/badge/frontend-React%2019%20%2B%20TypeScript-61dafb)
+![Database](https://img.shields.io/badge/db-PostgreSQL%20(Neon)-336791)
+![Telegram](https://img.shields.io/badge/telegram-Telethon%20StringSession-2AABEE)
+![Auth](https://img.shields.io/badge/auth-JWT%20HS256-orange)
 
 ---
 
 ## ✨ Features
 
-- 📁 **Folders** — organize Saved Messages files into named folders (create / rename / delete)
+- 📁 **Folders** — organize files into named folders (create / rename / delete)
 - ⬆️ **Upload** — drag & drop multiple files with per-file progress
-- 🖼️ **Gallery** — image grid with cached thumbnails and keyboard navigation
-- 🎬 **Streaming previews** — video/audio play with **seeking** (HTTP Range / 206 Partial Content), no full download needed
-- 🔍 **Search** — instant client-side filtering, API fallback for cold cache
-- 📄 **Previews** — images, video, audio, and PDFs in a modal
-- ⚡ **Fast** — file index cached in SQLite, incremental sync from Telegram
-- 🔐 **Private by design** — runs on `127.0.0.1`, credentials encrypted at rest, nothing leaves your machine except Telegram API calls
+- 🖼️ **Image gallery** — grid thumbnails with keyboard navigation and full-res click-through
+- 🎬 **Streaming previews** — video & audio play with **seeking** (HTTP Range / 206 Partial Content)
+- 📄 **PDF preview** — inline iframe viewer on desktop, open-in-tab on mobile
+- 🔍 **Search** — instant client-side filtering across all files
+- ⚡ **Fast** — file index cached in memory (1-hour TTL), single JOIN query on DB miss
+- 🔐 **Secure** — JWT auth, Fernet-encrypted credentials at rest, rate limiting
 
 ---
 
 ## 🏗️ How It Works
 
 ```
-┌─────────────┐     HTTP      ┌──────────────────┐    MTProto    ┌──────────────┐
-│   Browser    │ ───────────► │  FastAPI backend  │ ────────────► │   Telegram    │
-│  (React SPA) │ ◄─────────── │  (port 5001)      │ ◄──────────── │ Saved Messages│
-└─────────────┘               └──────────────────┘               └──────────────┘
-                                       │
-                                       ▼
-                              ┌──────────────────┐
-                              │ SQLite + caches   │
-                              │ telecloud.db      │
-                              │ thumbs/ sessions/ │
-                              └──────────────────┘
+┌─────────────┐     HTTP/JWT    ┌──────────────────┐    MTProto    ┌──────────────┐
+│   Browser    │ ─────────────► │  FastAPI backend  │ ────────────► │   Telegram    │
+│  (React SPA) │ ◄───────────── │  (port 5001)      │ ◄──────────── │ Saved Messages│
+└─────────────┘                 └──────────────────┘               └──────────────┘
+                                         │
+                                         ▼
+                                ┌──────────────────┐
+                                │  Neon PostgreSQL  │
+                                │  (users, files,   │
+                                │   folders, etc.)  │
+                                └──────────────────┘
 ```
 
 - **Files** are stored as media messages in your Telegram **Saved Messages** — nothing is stored on a third-party server.
-- **Folders** are implemented as message captions (`folder: <name>`) plus a row in SQLite — moving a file just edits its caption.
-- **The file index** (names, sizes, types, dates) is scanned from Telegram once, cached in SQLite, and incrementally synced afterwards.
-- **Thumbnails** are downloaded once and cached on disk in `thumbs/`.
+- **Folders** are implemented as message captions + a row in PostgreSQL. Moving a file just updates its `folder_id`.
+- **The file index** (names, sizes, types, dates) is scanned from Telegram once, cached in memory, and synced on demand.
+- **Thumbnails** are downloaded from Telegram and cached on disk in `thumbs/`.
+- **Auth** uses JWT HS256 tokens (30-day expiry) stored in `localStorage`. Media endpoints (`/file/`, `/thumbnail/`) also accept the token via `?token=` query param so `<img>` / `<video>` / `<audio>` src attributes work natively.
 
 ---
 
@@ -49,9 +54,11 @@ TeleCloud turns Telegram's unlimited Saved Messages storage into a proper file m
 | Layer | Technology |
 |---|---|
 | Backend | [FastAPI](https://fastapi.tiangolo.com/) (async) + Uvicorn |
-| Telegram client | [Telethon](https://docs.telethon.dev/) (MTProto) |
-| Database | SQLite via [SQLModel](https://sqlmodel.tiangolo.com/) |
-| Encryption | Fernet (`cryptography`) for API credentials at rest |
+| Telegram client | [Telethon](https://docs.telethon.dev/) StringSession (MTProto) |
+| Database | PostgreSQL via [SQLModel](https://sqlmodel.tiangolo.com/) / SQLAlchemy |
+| Hosted DB | [Neon](https://neon.tech/) (serverless PostgreSQL) |
+| Encryption | Fernet (`cryptography`) for API credentials + StringSession at rest |
+| Auth | JWT HS256 — `python-jose` / `PyJWT` |
 | Frontend | React 19 + TypeScript + [Vite](https://vitejs.dev/) |
 | State | [Zustand](https://zustand-demo.pmnd.rs/) |
 | Routing | React Router 7 |
@@ -63,35 +70,33 @@ TeleCloud turns Telegram's unlimited Saved Messages storage into a proper file m
 
 ```
 telecloud/
-├── backend/                  # FastAPI application
-│   ├── main.py               # App entry: middleware, routers, SPA serving, maintenance loop
-│   ├── auth.py               # Session tokens, CSRF (double-submit cookie), auth dependency
-│   ├── database.py           # SQLModel tables + all DB operations
-│   ├── telegram_client.py    # Telethon client pool (one client per logged-in phone)
-│   ├── cache.py              # In-memory TTL cache with periodic sweep
-│   ├── security.py           # Rate limiting + input validation
+├── backend/
+│   ├── main.py               # App entry: CORS, routers, SPA serving, maintenance loop
+│   ├── auth.py               # JWT creation/verification; get_current_user + get_media_user deps
+│   ├── database.py           # SQLModel tables, all DB helpers, in-memory credential cache
+│   ├── telegram_client.py    # Telethon client pool, backoff, asyncio timeout guard
+│   ├── cache.py              # In-memory TTL cache (1 hour) with periodic sweep
+│   ├── security.py           # Rate limiting, file validation, input sanitization
 │   └── routes/
-│       ├── auth.py           # Setup, login (OTP + 2FA), logout, account deletion
+│       ├── auth.py           # Setup, OTP login, 2FA, logout, account deletion
 │       ├── files.py          # List, search, stream, upload, move, delete, thumbnails
 │       └── folders.py        # Folder CRUD + per-folder file listing + counts
 │
-├── frontend/                 # React SPA source
-│   ├── src/
-│   │   ├── api/client.ts     # Typed API layer, CSRF injection, 401 handling
-│   │   ├── store/index.ts    # Zustand store (files, folders, selection, view)
-│   │   ├── pages/            # Setup, Login, Dashboard, Consent, PrivacyPolicy
-│   │   ├── components/       # FileGrid, FolderGrid, Gallery, PreviewModal,
-│   │   │                     # UploadZone, SearchBar, ConfirmModal, FileCard
-│   │   └── hooks/            # useLazyLoad (IntersectionObserver thumbnails)
-│   └── vite.config.ts        # Dev proxy → :5001, build → ../static/app
+├── frontend/
+│   └── src/
+│       ├── api/client.ts     # Typed API layer, JWT injection, 401 redirect
+│       ├── store/index.ts    # Zustand store (files, folders, selection, view state)
+│       ├── pages/            # Setup, Login, Dashboard, Consent, PrivacyPolicy
+│       ├── components/       # FileGrid, FolderGrid, Gallery, PreviewModal,
+│       │                     # UploadZone, SearchBar, ConfirmModal, FileCard
+│       └── hooks/            # useLazyLoad (IntersectionObserver for lazy thumbnails)
 │
-├── static/app/               # Production build output (gitignored, auto-generated)
-├── sessions/                 # Telethon session files (gitignored — your TG login!)
+├── static/app/               # Production build output (gitignored — run npm run build)
 ├── thumbs/                   # Thumbnail disk cache (gitignored)
-├── telecloud.db              # SQLite database (gitignored)
+├── uploads/                  # Temp upload staging area (gitignored)
 ├── start.sh                  # One-command run: build frontend if stale + start server
 ├── requirements.txt
-└── .env.example              # Template for required environment variables
+└── .env.example              # Template for all required environment variables
 ```
 
 ---
@@ -100,15 +105,16 @@ telecloud/
 
 ### Prerequisites
 
-- **Python 3.9+**
-- **Node.js 18+** (only needed to build the frontend)
+- **Python 3.10+**
+- **Node.js 18+** (to build the frontend)
 - A **Telegram account**
 - **Telegram API credentials** — get them free at [my.telegram.org](https://my.telegram.org) → *API development tools* → create an app → copy `api_id` and `api_hash`
+- A **PostgreSQL database** — [Neon](https://neon.tech/) has a free tier that works out of the box
 
 ### 1. Clone & install
 
 ```bash
-git clone https://github.com/revanth4033/telecloud.git
+git clone https://github.com/telecloud7099/telecloud.git
 cd telecloud
 
 # Python dependencies
@@ -124,26 +130,43 @@ cd frontend && npm install && cd ..
 cp .env.example .env
 ```
 
-Generate the encryption key and put it in `.env`:
+Fill in `.env`:
 
 ```bash
-python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# PostgreSQL connection string (Neon or any PostgreSQL)
+DATABASE_URL=postgresql://user:pass@host/dbname?sslmode=require
+
+# JWT signing secret — generate one:
+# python3 -c "import secrets; print(secrets.token_hex(32))"
+JWT_SECRET=your_jwt_secret_here
+
+# Fernet key for encrypting API credentials + sessions at rest — generate one:
+# python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+ENCRYPTION_KEY=your_fernet_key_here
 ```
 
-### 3. Run
+### 3. Build frontend & run
+
+```bash
+# Build the React app into static/app/
+cd frontend && npm run build && cd ..
+
+# Start the server
+python -m uvicorn backend.main:app --host 0.0.0.0 --port 5001
+```
+
+Or use the convenience script:
 
 ```bash
 ./start.sh
 ```
 
-This builds the frontend (only when source changed) and starts the server. Open:
-
-**http://127.0.0.1:5001**
+Open **http://localhost:5001**
 
 ### 4. First-time setup in the browser
 
 1. **Setup page** — paste your `api_id` and `api_hash` from my.telegram.org
-2. **Login** — enter your phone number → Telegram sends you a code → enter it (+ 2FA password if you have one)
+2. **Login** — enter your phone number → Telegram sends a code → enter it (+ 2FA password if enabled)
 3. **Done** — your Saved Messages files appear; create folders and start organizing
 
 ---
@@ -154,118 +177,100 @@ Run backend and frontend separately with hot reload:
 
 ```bash
 # Terminal 1 — backend with auto-reload
-python3 -m uvicorn backend.main:app --reload --port 5001
+python -m uvicorn backend.main:app --reload --port 5001
 
-# Terminal 2 — Vite dev server with HMR (proxies API calls to :5001)
+# Terminal 2 — Vite dev server with HMR (proxies /api calls to :5001)
 cd frontend && npm run dev    # → http://localhost:5173
-```
-
-Production build only:
-
-```bash
-cd frontend && npm run build   # outputs to static/app/
 ```
 
 ---
 
 ## ⚙️ Environment Variables
 
-| Variable | Default | Description |
+| Variable | Required | Description |
 |---|---|---|
-| `SECRET_KEY` | — **(required)** | Fernet key used to encrypt API credentials in SQLite |
-| `HOST` | `127.0.0.1` | Server bind address (keep localhost unless you know what you're doing) |
-| `PORT` | `5001` | Server port |
-| `SECURE_COOKIES` | `false` | Set `true` when serving over HTTPS |
-| `MAX_SCAN_MESSAGES` | `2000` | Max Saved Messages scanned when building the file index (`0` = unlimited) |
-| `SESSION_TIMEOUT` | `604800` | Web session lifetime in seconds (7 days) |
-| `API_SESSION_TTL` | `604800` | How long stored API credentials live before purge (7 days) |
-| `DATABASE_URL` | `sqlite:///telecloud.db` | SQLModel database URL |
+| `DATABASE_URL` | ✅ | PostgreSQL connection string |
+| `JWT_SECRET` | ✅ | Secret for signing JWT tokens (use a long random hex string) |
+| `ENCRYPTION_KEY` | ✅ | Fernet key for encrypting Telegram credentials at rest |
+| `ALLOWED_ORIGINS` | | Comma-separated CORS origins (default: `http://localhost:5173,http://localhost:5001`) |
+| `MAX_SCAN_MESSAGES` | | Max Saved Messages to scan on first sync (default: `2000`, `0` = unlimited) |
 
 ---
 
 ## 🔌 API Reference
 
-All endpoints are JSON over HTTP. Authenticated routes require the session cookie + `X-CSRF-Token` header (double-submit pattern).
+All endpoints require `Authorization: Bearer <token>` except login/setup routes.
+Media endpoints (`/file/`, `/thumbnail/`) also accept `?token=<jwt>` for browser `<img>`/`<video>` compatibility.
 
 ### Auth
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/has-setup` | Whether API credentials are configured for this browser |
+| `POST` | `/check-phone` | Check if API credentials exist for a phone |
 | `POST` | `/setup-api` | Store Telegram `api_id`/`api_hash` (encrypted) |
 | `POST` | `/send_code` | Send OTP to phone via Telegram |
-| `POST` | `/verify_code` | Verify OTP → sets session cookie |
-| `POST` | `/verify_password` | 2FA cloud-password verification |
-| `GET` | `/me` | Current session's phone + setup state |
-| `POST` | `/logout` | Destroy session, disconnect Telegram client |
-| `POST` | `/delete_data` | Wipe all local data for the account |
+| `POST` | `/verify_code` | Verify OTP → returns JWT |
+| `POST` | `/verify_password` | 2FA cloud-password verification → returns JWT |
+| `GET` | `/me` | Current user info |
+| `POST` | `/logout` | Disconnect Telegram client |
+| `POST` | `/delete_data` | Wipe all data for the account |
 
 ### Files
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/files?offset=&limit=&category=&refresh=` | Paginated file list (cached) |
+| `GET` | `/files` | Paginated file list (`offset`, `limit`, `category`, `refresh`) |
 | `GET` | `/files/search?q=` | Search by filename |
-| `GET` | `/files/stats` | Scan limit / has-more info |
-| `POST` | `/files/sync` | Incremental sync of new messages |
-| `GET` | `/file/{msg_id}` | **Stream** file — supports HTTP `Range` (`?download=true` for attachment) |
-| `GET` | `/thumbnail/{msg_id}` | Cached thumbnail |
-| `POST` | `/upload` | Multipart upload → Telegram |
-| `POST` | `/files/move` | Move files to a folder (parallel caption edits) |
-| `DELETE` | `/files` | Delete files (batched) |
+| `GET` | `/files/stats` | Cache/scan status |
+| `POST` | `/files/sync` | Incremental sync of new Telegram messages |
+| `GET` | `/file/{msg_id}` | Stream file — supports HTTP `Range` for video seeking |
+| `GET` | `/thumbnail/{msg_id}` | Disk-cached thumbnail (JPEG) |
+| `POST` | `/upload` | Multipart upload → sends to Telegram Saved Messages |
+| `POST` | `/files/move` | Move files to a folder |
+| `DELETE` | `/files` | Delete files (from Telegram + DB) |
 
 ### Folders
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/folders` | List folders |
-| `GET` | `/folders/counts` | File count + size per folder |
+| `GET` | `/folders` | List all folders |
+| `GET` | `/folders/counts` | File count + total size per folder |
 | `POST` | `/folders` | Create folder |
-| `PUT` | `/folders/{name}` | Rename (rewrites captions in parallel) |
-| `DELETE` | `/folders/{name}` | Delete folder label (files stay in Telegram) |
-| `GET` | `/folders/{name}/files` | Files in a folder |
+| `PUT` | `/folders/{name}` | Rename folder |
+| `DELETE` | `/folders/{name}` | Delete folder (files stay in Telegram, unassigned) |
+| `GET` | `/folders/{name}/files` | Files in a specific folder |
 
 ---
 
-## 🗄️ Database Schema (SQLite)
+## 🗄️ Database Schema
 
 | Table | Purpose |
 |---|---|
-| `apisession` | Encrypted Telegram API credentials, per browser session |
-| `appsession` | Web login sessions (token → phone) |
-| `userfolder` | Folder names per account (phone is stored as a SHA-256 hash) |
-| `cachedfile` | The file index synced from Telegram |
-| `syncstate` | Last sync timestamp + newest message id per account |
+| `users` | Telegram user id, username, first name |
+| `user_api_credentials` | Encrypted `api_id` + `api_hash` per user |
+| `user_sessions` | Encrypted Telethon StringSession per user |
+| `folders` | Named folders per user |
+| `files` | File index synced from Telegram (name, size, mime, category, folder) |
+| `sync_state` | Last sync timestamp + newest message id per user |
+| `user_settings` | Per-user preferences (theme, scan limit, etc.) |
 
 ---
 
 ## 🔐 Security Model
 
-- Server binds to **localhost only** by default — not reachable from the network
-- Telegram API credentials are **Fernet-encrypted** in SQLite (`SECRET_KEY`)
-- Phone numbers are stored as **SHA-256 hashes**, never in plaintext
-- **CSRF protection** via double-submit cookie on all mutating requests
-- **Rate limiting** on auth endpoints
-- Session files, the database, thumbnails, and `.env` are **gitignored** — never committed
-- React renders all user/server strings as text (no `innerHTML`) — XSS-safe by construction
-
-> ⚠️ TeleCloud is designed for **personal, local use**. Before exposing it publicly you'd want HTTPS, `SECURE_COOKIES=true`, and a review of `SECURITY_NOTES.md`.
+- JWT tokens (HS256, 30-day expiry) stored in `localStorage`; validated on every request
+- Telegram API credentials and StringSession encrypted with **Fernet** (`ENCRYPTION_KEY`)
+- Phone numbers stored as **SHA-256 hashes**, never in plaintext
+- **Rate limiting** on all mutating endpoints
+- **30-second backoff** after Telegram connection failure — prevents cascade timeouts
+- Media endpoints accept `?token=` query param (for `<img src>`) but write endpoints are header-only
+- `.env`, session data, database dumps, thumbnails, and uploads are **gitignored**
 
 ---
 
 ## ⚠️ Limitations
 
 - Files larger than **2 GB** can't be uploaded (Telegram limit)
-- The initial index scans up to `MAX_SCAN_MESSAGES` (default 2000) most-recent Saved Messages — raise it (or set `0`) if you have more
-- One Telegram account per browser session
-- Deleting a file in TeleCloud deletes the underlying Saved Message (that's the point — but know it!)
-
----
-
-## 📚 Project Docs
-
-| File | Contents |
-|---|---|
-| `IMPLEMENTATION_PLAN.md` | The Flask→FastAPI / vanilla-JS→React migration plan (completed) |
-| `TECH_DEBT.md` | Catalogue of issues in the original prototype and how each was fixed |
-| `SECURITY_NOTES.md` | Security review notes — items to revisit before public hosting |
+- Initial scan covers the `MAX_SCAN_MESSAGES` most-recent Saved Messages (raise or set `0` for unlimited)
+- One Telegram account per server instance
+- Deleting a file in TeleCloud permanently deletes the Saved Message from Telegram
 
 ---
 
