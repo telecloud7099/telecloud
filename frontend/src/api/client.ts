@@ -213,7 +213,7 @@ export const uploadFiles = (folder: string, files: File[], onProgress?: (pct: nu
     files.forEach(f => form.append('file', f))
 
     const xhr = new XMLHttpRequest()
-    xhr.open('POST', '/upload')
+    xhr.open('POST', `${API_BASE}/upload`)
     const token = getToken()
     if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
 
