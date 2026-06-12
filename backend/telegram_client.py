@@ -156,3 +156,8 @@ async def _drop(key):
             await asyncio.wait_for(client.disconnect(), timeout=5)
         except Exception:
             pass
+
+
+def get_active_sessions() -> dict:
+    user_ids = [k for k in _clients if isinstance(k, int) and _clients[k].is_connected()]
+    return {"count": len(user_ids), "user_ids": user_ids}

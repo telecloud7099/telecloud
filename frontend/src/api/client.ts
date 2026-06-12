@@ -154,6 +154,8 @@ export const logout = () => apiFetch('/logout', { method: 'POST' })
 
 export const deleteData = () => apiFetch('/delete_data', { method: 'POST' })
 
+export const getAdminHealth = () => apiFetch('/admin/health')
+
 // ── Folders ──────────────────────────────────────────────────────────────────
 
 export const listFolders = () => apiFetch('/folders')

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import time as _time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
@@ -12,9 +13,11 @@ from dotenv import load_dotenv
 
 from backend.database import init_db
 from backend.cache import cache_sweep
+from backend.metrics import record_response
 from backend.routes import auth as auth_router
 from backend.routes import files as files_router
 from backend.routes import folders as folders_router
+from backend.routes import admin as admin_router
 
 load_dotenv()
 
@@ -74,10 +77,20 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def error_middleware(request: Request, call_next):
+async def timing_middleware(request: Request, call_next):
+    start = _time.perf_counter()
     try:
-        return await call_next(request)
+        response = await call_next(request)
+        elapsed_ms = (_time.perf_counter() - start) * 1000
+        # Skip streaming responses (file downloads) — they skew averages to minutes
+        content_type = response.headers.get("content-type", "")
+        is_stream = isinstance(response, Response) and response.headers.get("transfer-encoding") == "chunked"
+        if not is_stream and "application/json" in content_type or content_type == "":
+            record_response(elapsed_ms, is_error=response.status_code >= 500)
+        return response
     except Exception as e:
+        elapsed_ms = (_time.perf_counter() - start) * 1000
+        record_response(elapsed_ms, is_error=True)
         logger.error(f"Unhandled error in {request.method} {request.url.path}: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error"})
 
@@ -90,6 +103,7 @@ async def health():
 app.include_router(auth_router.router)
 app.include_router(files_router.router)
 app.include_router(folders_router.router)
+app.include_router(admin_router.router)
 
 if os.path.isdir(_APP_DIR):
     app.mount("/assets", StaticFiles(directory=os.path.join(_APP_DIR, "assets")), name="assets")
