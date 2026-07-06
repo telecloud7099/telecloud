@@ -104,13 +104,21 @@ async def get_unauthenticated_client(phone: str, api_id: int, api_hash: str) -> 
         if client.is_connected():
             return client
         try:
-            await client.connect()
+            await asyncio.wait_for(client.connect(), timeout=12)
             return client
         except Exception:
             del _clients[key]  # type: ignore[arg-type]
 
-    client = TelegramClient(StringSession(), api_id, api_hash)
-    await client.connect()
+    client = TelegramClient(StringSession(), api_id, api_hash, connection_retries=1)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=12)
+    except (asyncio.TimeoutError, Exception) as e:
+        logger.warning(f"Unauthenticated Telegram connect failed for {phone}: {e}")
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=3)
+        except Exception:
+            pass
+        raise Exception("Telegram connection timed out. Please try again.")
     _clients[key] = client  # type: ignore[index]
     return client
 

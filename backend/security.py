@@ -64,6 +64,17 @@ def sanitize_input(text: Optional[str]) -> str:
     return re.sub(r"[<>\"']", "", text).strip()
 
 
+def rate_limit_sweep() -> None:
+    """Remove IPs with no activity in the last hour to prevent unbounded growth."""
+    cutoff = time.time() - 3600
+    stale = [ip for ip, timestamps in rate_limit_storage.items()
+             if not timestamps or timestamps[-1] < cutoff]
+    for ip in stale:
+        del rate_limit_storage[ip]
+    if stale:
+        logger.debug(f"Rate limit sweep removed {len(stale)} stale IPs")
+
+
 def log_security_event(request: Request, event_type: str, details: str, phone: Optional[str] = None):
     logger.info(
         "SECURITY EVENT: type=%s ip=%s phone=%s ua=%s details=%s",

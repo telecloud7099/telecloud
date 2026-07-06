@@ -7,7 +7,7 @@ from typing import Optional
 from uuid import UUID, uuid4
 
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from sqlalchemy import BigInteger, Column, UniqueConstraint, Index
+from sqlalchemy import BigInteger, Column, UniqueConstraint, Index, text
 from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
@@ -88,7 +88,11 @@ class Folder(SQLModel, table=True):
 
 class TelegramFile(SQLModel, table=True):
     __tablename__ = "files"
-    __table_args__ = (UniqueConstraint("telegram_user_id", "telegram_message_id", name="uq_files_user_msg"),)
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", "telegram_message_id", name="uq_files_user_msg"),
+        Index("ix_files_user_uploaded", "telegram_user_id", "uploaded_at"),
+        Index("ix_files_folder_id", "folder_id"),
+    )
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     telegram_user_id: int = Field(sa_column=Column("telegram_user_id", BigInteger(), nullable=False, index=True))
     folder_id: Optional[UUID] = Field(default=None, foreign_key="folders.id")
@@ -120,8 +124,22 @@ class UserSettings(SQLModel, table=True):
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 
+def _apply_migrations() -> None:
+    """Idempotently add indexes to existing databases. create_all only covers new tables."""
+    stmts = [
+        "CREATE INDEX IF NOT EXISTS ix_files_user_uploaded ON files (telegram_user_id, uploaded_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_files_folder_id ON files (folder_id)",
+    ]
+    with engine.connect() as conn:
+        for stmt in stmts:
+            conn.execute(text(stmt))
+        conn.commit()
+    logger.info("Database migrations applied")
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
+    _apply_migrations()
 
 
 def get_session():

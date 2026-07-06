@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from backend.database import init_db
 from backend.cache import cache_sweep
 from backend.metrics import record_response
+from backend.security import rate_limit_sweep
 from backend.routes import auth as auth_router
 from backend.routes import files as files_router
 from backend.routes import folders as folders_router
@@ -48,6 +49,7 @@ async def _maintenance_loop():
         await asyncio.sleep(900)
         try:
             cache_sweep()
+            rate_limit_sweep()
         except Exception as e:
             logger.error(f"Maintenance loop error: {e}")
 

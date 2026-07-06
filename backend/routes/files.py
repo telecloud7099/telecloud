@@ -27,6 +27,8 @@ UPLOAD_FOLDER = "uploads"
 THUMB_FOLDER = "thumbs"
 PAGE_SIZE = 50
 MAX_SCAN_MESSAGES = int(os.getenv("MAX_SCAN_MESSAGES", "2000") or "2000")
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "500") or "500")
+_MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 # Tracks users currently undergoing a background full scan
 _syncing_users: set[int] = set()
@@ -150,7 +152,7 @@ async def _incremental_sync(telegram_user_id: int, force: bool = False) -> int:
         update_sync_state(telegram_user_id, last_sync_at=_time.time(), newest_msg_id=newest_id)
         return len(new_files)
     except Exception as e:
-        logger.error(f"Incremental sync error for user {telegram_user_id}: {e}")
+        logger.error(f"Incremental sync error for user {telegram_user_id}: {e}", exc_info=True)
         return 0
 
 
@@ -336,7 +338,7 @@ async def get_file(
 
         return StreamingResponse(full_iter(), media_type=mime, headers=headers)
     except Exception as e:
-        logger.error(f"GET FILE ERROR: {e}")
+        logger.error(f"GET FILE ERROR: {e}", exc_info=True)
         return JSONResponse(status_code=404, content={"status": "error", "message": "File not found"})
 
 
@@ -392,7 +394,7 @@ async def get_thumbnail(
         return Response(content=thumb_bytes, media_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=604800"})
     except Exception as e:
-        logger.error(f"GET THUMBNAIL ERROR: {e}")
+        logger.error(f"GET THUMBNAIL ERROR: {e}", exc_info=True)
         return JSONResponse(status_code=404, content={"status": "error", "message": "Not found"})
 
 
@@ -425,6 +427,18 @@ async def upload(
         filename = f"{uuid.uuid4().hex}_{f.filename}"
         path = os.path.join(UPLOAD_FOLDER, filename)
         content = await f.read()
+        if len(content) > _MAX_UPLOAD_BYTES:
+            logger.warning(
+                f"Upload rejected: {f.filename!r} is {len(content) // (1024 * 1024)}MB, "
+                f"limit {MAX_UPLOAD_MB}MB (user={telegram_user_id})"
+            )
+            for _, sp in saved:
+                if os.path.exists(sp):
+                    os.remove(sp)
+            return JSONResponse(
+                status_code=413,
+                content={"status": "error", "message": f"'{f.filename}' exceeds the {MAX_UPLOAD_MB} MB size limit."},
+            )
         with open(path, "wb") as fp:
             fp.write(content)
         saved.append((f.filename, path))
@@ -457,7 +471,7 @@ async def upload(
                 )
                 uploaded.append(orig_name)
             except Exception as e:
-                logger.error(f"Error uploading {orig_name}: {e}")
+                logger.error(f"Error uploading {orig_name}: {e}", exc_info=True)
                 failed.append(orig_name)
             finally:
                 if os.path.exists(path):
