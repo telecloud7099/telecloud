@@ -2,9 +2,20 @@ import asyncio
 import logging
 import time as _time
 from telethon import TelegramClient
+from telethon.errors import AuthKeyDuplicatedError
 from telethon.sessions import StringSession
 
 logger = logging.getLogger(__name__)
+
+
+class SessionRevokedError(Exception):
+    """Telegram permanently invalidated the stored StringSession (the same auth key was
+    used from two IP addresses at once — e.g. a local and a deployed backend sharing one
+    database). Retrying can never succeed; the user must log in again. main.py maps this
+    to a 401 so the frontend redirects to the login screen."""
+
+    def __init__(self):
+        super().__init__("Your Telegram session was disconnected because it was used from two places at once. Please log in again.")
 
 # telegram_user_id → TelegramClient (in-memory pool; rebuilt from DB on restart)
 _clients: dict[int, TelegramClient] = {}
@@ -77,6 +88,15 @@ async def get_client(
         client = TelegramClient(session, api_id, api_hash, connection_retries=1)
         try:
             await asyncio.wait_for(client.connect(), timeout=12)
+        except AuthKeyDuplicatedError:
+            # Permanent: Telegram killed this auth key for concurrent use from two IPs.
+            # No backoff/retry — surface it so the caller wipes the stored session.
+            logger.error(f"Telegram revoked the session for user {telegram_user_id} (AuthKeyDuplicatedError)")
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=3)
+            except Exception:
+                pass
+            raise SessionRevokedError()
         except (asyncio.TimeoutError, Exception) as e:
             _connect_failed_at[telegram_user_id] = _time.time()
             logger.warning(f"Telegram connect failed for user {telegram_user_id}: {e}")
@@ -169,3 +189,25 @@ async def _drop(key):
 def get_active_sessions() -> dict:
     user_ids = [k for k in _clients if isinstance(k, int) and _clients[k].is_connected()]
     return {"count": len(user_ids), "user_ids": user_ids}
+
+
+async def get_user_client(telegram_user_id: int, require_authorized: bool = False) -> TelegramClient:
+    """Shared entry point for routes that need a connected, authenticated client for a user —
+    loads credentials/StringSession from the DB and persists the session if Telethon rotated it."""
+    from backend.database import get_api_credentials, load_string_session, save_string_session
+
+    api_id, api_hash = get_api_credentials(telegram_user_id)
+    if not api_id:
+        raise Exception("API credentials not found")
+    string_session = load_string_session(telegram_user_id) or ""
+    try:
+        client = await get_client(telegram_user_id, api_id, api_hash, string_session, require_authorized)
+    except SessionRevokedError:
+        # The stored session can never work again — wipe it so nothing keeps retrying it,
+        # and so the next login starts clean.
+        save_string_session(telegram_user_id, "")
+        raise
+    saved = get_string_session(telegram_user_id)
+    if saved and saved != string_session:
+        save_string_session(telegram_user_id, saved)
+    return client

@@ -25,7 +25,7 @@ export interface Folder {
 }
 
 export interface TeleFile {
-  id: number
+  id: string
   name: string
   size: number
   mime_type: string
@@ -85,6 +85,23 @@ async function apiFetch(url: string, options: RequestInit = {}, signal?: AbortSi
     throw new Error('Unauthorized')
   }
   return res
+}
+
+// A dropped connection or a backend restart mid-request leaves the browser with a Response
+// that has no (or garbled) body — calling .json() directly on that throws a cryptic
+// "Unexpected end of JSON input" with no indication of what actually went wrong. Reading
+// the text first lets us tell that case apart from a real application error and say
+// something a user can act on.
+export async function safeJson(res: Response, action: string): Promise<any> {
+  const text = await res.text()
+  if (!text) {
+    throw new Error(`${action} failed: no response from the server — it may have restarted or your connection dropped. Try again.`)
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error(`${action} failed: the server sent back an unreadable response. Try again.`)
+  }
 }
 
 function post<T>(url: string, body: T) {
@@ -192,21 +209,66 @@ export const syncFiles = () => apiFetch('/files/sync', { method: 'POST' })
 export const searchFiles = (q: string) =>
   apiFetch(`/files/search?q=${encodeURIComponent(q)}`)
 
-export const fileUrl = (id: number, download = false) => {
+export const fileUrl = (id: string, download = false) => {
   const token = getToken()
   const params = new URLSearchParams({ token })
   if (download) params.set('download', 'true')
   return `${API_BASE}/file/${id}?${params}`
 }
 
-export const thumbnailUrl = (id: number) =>
+export const thumbnailUrl = (id: string) =>
   `${API_BASE}/thumbnail/${id}?token=${encodeURIComponent(getToken())}`
 
-export const moveFiles = (folder: string, msgIds: number[]) =>
-  post('/files/move', { folder, msg_ids: msgIds })
+export const moveFiles = (folder: string, fileIds: string[]) =>
+  post('/files/move', { folder, file_ids: fileIds })
 
-export const deleteFiles = (msgIds: number[]) =>
-  del('/files', { msg_ids: msgIds })
+export const deleteFiles = (fileIds: string[]) =>
+  del('/files', { file_ids: fileIds })
+
+// ── Chunked upload (files too large for a single Telegram document) ──────────
+
+export interface UploadSessionInfo {
+  status: string
+  chunked: boolean
+  chunk_size: number
+  session_id?: string
+  session_status?: string
+  next_part_number?: number
+  total_chunks?: number
+  bytes_uploaded?: number
+  total_size?: number
+}
+
+export const createUploadSession = (filename: string, totalSize: number, mimeType: string, folderName: string) =>
+  post('/uploads', { filename, total_size: totalSize, mime_type: mimeType, folder_name: folderName })
+
+export const getUploadSession = (sessionId: string) => apiFetch(`/uploads/${sessionId}`)
+
+export const completeUploadSession = (sessionId: string) => post(`/uploads/${sessionId}/complete`, {})
+
+export const abortUploadSession = (sessionId: string) => del(`/uploads/${sessionId}`)
+
+export const uploadPart = (
+  sessionId: string, partNumber: number, blob: Blob, onProgress?: (pct: number) => void,
+): Promise<Response> => {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('PUT', `${API_BASE}/uploads/${sessionId}/parts/${partNumber}`)
+    const token = getToken()
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+
+    if (onProgress) {
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100))
+      }
+    }
+
+    xhr.onload = () => resolve(new Response(xhr.responseText, { status: xhr.status }))
+    xhr.onerror = () => reject(new Error(`Part ${partNumber} upload failed`))
+    xhr.send(blob)
+  })
+}
 
 export const uploadFiles = (folder: string, files: File[], onProgress?: (pct: number) => void): Promise<Response> => {
   return new Promise((resolve, reject) => {

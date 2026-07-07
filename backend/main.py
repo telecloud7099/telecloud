@@ -15,10 +15,14 @@ from backend.database import init_db
 from backend.cache import cache_sweep
 from backend.metrics import record_response
 from backend.security import rate_limit_sweep
+from backend.chunk_upload import chunk_upload_sweep
+from backend.telegram_client import SessionRevokedError
+from backend.upload_sessions import session_sweep
 from backend.routes import auth as auth_router
 from backend.routes import files as files_router
 from backend.routes import folders as folders_router
 from backend.routes import admin as admin_router
+from backend.routes import upload as upload_router
 
 load_dotenv()
 
@@ -50,6 +54,8 @@ async def _maintenance_loop():
         try:
             cache_sweep()
             rate_limit_sweep()
+            chunk_upload_sweep()
+            await session_sweep()
         except Exception as e:
             logger.error(f"Maintenance loop error: {e}")
 
@@ -97,6 +103,13 @@ async def timing_middleware(request: Request, call_next):
         return JSONResponse(status_code=500, content={"status": "error", "message": "Internal server error"})
 
 
+@app.exception_handler(SessionRevokedError)
+async def session_revoked_handler(request: Request, exc: SessionRevokedError):
+    # 401 (not 500) so the frontend's apiFetch clears the JWT and redirects to login —
+    # a revoked Telegram auth key can never recover on its own.
+    return JSONResponse(status_code=401, content={"status": "error", "message": str(exc)})
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -106,6 +119,7 @@ app.include_router(auth_router.router)
 app.include_router(files_router.router)
 app.include_router(folders_router.router)
 app.include_router(admin_router.router)
+app.include_router(upload_router.router)
 
 if os.path.isdir(_APP_DIR):
     app.mount("/assets", StaticFiles(directory=os.path.join(_APP_DIR, "assets")), name="assets")

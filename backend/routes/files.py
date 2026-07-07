@@ -5,20 +5,23 @@ import logging
 import time as _time
 from datetime import datetime
 from typing import AsyncIterator, Optional
+from urllib.parse import quote
 from fastapi import APIRouter, Request, Depends, UploadFile, File, Form, Query
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel
 
 from backend.auth import get_current_user, get_media_user
 from backend.database import (
-    get_api_credentials, load_string_session,
     db_get_files, db_upsert_files, db_insert_file, db_delete_files_by_ids,
     db_move_files, get_sync_state, update_sync_state,
-    add_folder, get_folder_by_name, folder_exists,
+    add_folder, get_folder_by_name, folder_exists, get_file_by_id, get_file_chunks_ordered,
+    get_user_session_ids, recover_chunked_file,
 )
-from backend.telegram_client import get_client, get_string_session, remove_client, is_client_connected
+from backend.telegram_client import get_user_client, remove_client, is_client_connected, SessionRevokedError
 from backend.cache import cache_get, cache_set, cache_invalidate
 from backend.security import rate_limit_check, validate_file_upload, sanitize_input, log_security_event
+from backend.chunk_upload import parse_chunk_caption
+import backend.chunk_download as chunk_download
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -26,6 +29,17 @@ logger = logging.getLogger(__name__)
 UPLOAD_FOLDER = "uploads"
 THUMB_FOLDER = "thumbs"
 PAGE_SIZE = 50
+
+
+def _content_disposition(disposition: str, filename: str) -> str:
+    """HTTP headers are latin-1 only, so any filename beyond that (en-dash, emoji,
+    non-Latin scripts) must ride in the RFC 5987 filename* parameter; the plain
+    filename= stays as an ASCII fallback for old clients."""
+    fallback = (
+        filename.encode("ascii", "replace").decode()
+        .replace('"', '_').replace('\r', '').replace('\n', '')
+    )
+    return f"{disposition}; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename, safe='')}"
 MAX_SCAN_MESSAGES = int(os.getenv("MAX_SCAN_MESSAGES", "2000") or "2000")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "500") or "500")
 _MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
@@ -79,26 +93,47 @@ def _categorize(name: str, mime: str) -> str:
     return "Other"
 
 
-async def _get_telegram_client(telegram_user_id: int, require_authorized: bool = False):
-    api_id, api_hash = get_api_credentials(telegram_user_id)
-    if not api_id:
-        raise Exception("API credentials not found")
-    string_session = load_string_session(telegram_user_id) or ""
-    client = await get_client(telegram_user_id, api_id, api_hash, string_session, require_authorized)
-    # Only persist StringSession if it changed (saves a DB write on every call)
-    saved = get_string_session(telegram_user_id)
-    if saved and saved != string_session:
-        from backend.database import save_string_session
-        save_string_session(telegram_user_id, saved)
-    return client
-
-
 # ── Sync helpers ──────────────────────────────────────────────────────────────
 
+def _reconcile_chunk_groups(telegram_user_id: int, chunk_groups: dict[str, list]) -> int:
+    """Disaster recovery only: reconstructs chunked files whose grouping isn't in Postgres
+    (fresh device, DB wipe) from the captions collected during a scan. `chunk_groups` maps
+    group_id -> [(parsed_caption, msg), ...] for every chunk-part message seen that wasn't
+    already known (see get_user_session_ids). A group missing any of its parts within the
+    scanned window is left alone rather than reconstructed partially — it's picked up
+    whenever a scan happens to observe all of its parts together."""
+    recovered = 0
+    for group_id, entries in chunk_groups.items():
+        entries.sort(key=lambda e: e[0]["part_number"])
+        total_chunks = entries[0][0]["total_chunks"]
+        if len(entries) != total_chunks:
+            logger.warning(
+                f"Incomplete chunk group {group_id} for user {telegram_user_id}: "
+                f"{len(entries)}/{total_chunks} parts seen in this scan — skipping"
+            )
+            continue
+
+        original_filename = entries[0][0]["original_filename"]
+        parts = [(p["part_number"], msg.id, msg.file.size or 0) for p, msg in entries]
+        total_size = sum(size for _, _, size in parts)
+        mime = entries[0][1].file.mime_type or "application/octet-stream"
+        category = _categorize(original_filename, mime)
+
+        recover_chunked_file(telegram_user_id, original_filename, total_size, mime, category, parts)
+        recovered += 1
+        logger.info(
+            f"Recovered chunked file {original_filename!r} from scan "
+            f"({total_chunks} parts, group {group_id}) for user {telegram_user_id}"
+        )
+    return recovered
+
+
 async def _full_scan(telegram_user_id: int) -> list[dict]:
-    client = await _get_telegram_client(telegram_user_id, require_authorized=True)
+    client = await get_user_client(telegram_user_id, require_authorized=True)
     max_scan = None if MAX_SCAN_MESSAGES == 0 else MAX_SCAN_MESSAGES
+    known_session_ids = {str(sid) for sid in get_user_session_ids(telegram_user_id)}
     files = []
+    chunk_groups: dict[str, list] = {}
     seen: set[int] = set()
     newest_id = 0
     async for msg in client.iter_messages("me", limit=max_scan):
@@ -107,6 +142,13 @@ async def _full_scan(telegram_user_id: int) -> list[dict]:
         seen.add(msg.id)
         if msg.id > newest_id:
             newest_id = msg.id
+
+        parsed = parse_chunk_caption(msg.text)
+        if parsed:
+            if parsed["group_id"] not in known_session_ids:
+                chunk_groups.setdefault(parsed["group_id"], []).append((parsed, msg))
+            continue
+
         mime = msg.file.mime_type or "application/octet-stream"
         name = _make_name(msg.file.name, mime, msg.id, msg.date)
         files.append({
@@ -118,6 +160,7 @@ async def _full_scan(telegram_user_id: int) -> list[dict]:
         })
     files.sort(key=lambda x: x.get("date") or "", reverse=True)
     db_upsert_files(telegram_user_id, files)
+    _reconcile_chunk_groups(telegram_user_id, chunk_groups)
     update_sync_state(telegram_user_id, last_sync_at=_time.time(), newest_msg_id=newest_id)
     return db_get_files(telegram_user_id)
 
@@ -127,15 +170,24 @@ async def _incremental_sync(telegram_user_id: int, force: bool = False) -> int:
     if not force and _time.time() - state["last_sync_at"] < 600:
         return 0
     try:
-        client = await _get_telegram_client(telegram_user_id, require_authorized=True)
+        client = await get_user_client(telegram_user_id, require_authorized=True)
+        known_session_ids = {str(sid) for sid in get_user_session_ids(telegram_user_id)}
         min_id = state["newest_msg_id"]
         new_files = []
+        chunk_groups: dict[str, list] = {}
         newest_id = min_id
         async for msg in client.iter_messages("me", min_id=min_id, limit=200):
             if not msg or not msg.file:
                 continue
             if msg.id > newest_id:
                 newest_id = msg.id
+
+            parsed = parse_chunk_caption(msg.text)
+            if parsed:
+                if parsed["group_id"] not in known_session_ids:
+                    chunk_groups.setdefault(parsed["group_id"], []).append((parsed, msg))
+                continue
+
             mime = msg.file.mime_type or "application/octet-stream"
             name = _make_name(msg.file.name, mime, msg.id, msg.date)
             new_files.append({
@@ -145,12 +197,15 @@ async def _incremental_sync(telegram_user_id: int, force: bool = False) -> int:
                 "category": _categorize(name, mime),
                 "caption": (msg.text or "").strip(),
             })
-        if new_files:
+        recovered = _reconcile_chunk_groups(telegram_user_id, chunk_groups)
+        if new_files or recovered:
             db_upsert_files(telegram_user_id, new_files)
             all_files = db_get_files(telegram_user_id)
             cache_set(f"{telegram_user_id}:all_files", all_files)
         update_sync_state(telegram_user_id, last_sync_at=_time.time(), newest_msg_id=newest_id)
-        return len(new_files)
+        return len(new_files) + recovered
+    except SessionRevokedError:
+        raise
     except Exception as e:
         logger.error(f"Incremental sync error for user {telegram_user_id}: {e}", exc_info=True)
         return 0
@@ -161,7 +216,7 @@ async def _warm_client(telegram_user_id: int):
     if is_client_connected(telegram_user_id):
         return
     try:
-        await _get_telegram_client(telegram_user_id, require_authorized=True)
+        await get_user_client(telegram_user_id, require_authorized=True)
         logger.info(f"Telegram client warmed for user {telegram_user_id}")
     except Exception as e:
         logger.debug(f"Telegram client warm-up failed for user {telegram_user_id}: {e}")
@@ -277,15 +332,72 @@ async def search_files(
 
 # ── Stream file ───────────────────────────────────────────────────────────────
 
-@router.get("/file/{msg_id}")
+@router.get("/file/{file_id}")
 async def get_file(
-    msg_id: int,
+    file_id: str,
     request: Request,
     download: bool = Query(False),
     telegram_user_id: int = Depends(get_media_user),
 ):
     try:
-        client = await _get_telegram_client(telegram_user_id, require_authorized=True)
+        file_row = get_file_by_id(telegram_user_id, uuid.UUID(file_id))
+        if not file_row:
+            return JSONResponse(status_code=404, content={"status": "error", "message": "File not found"})
+
+        if file_row.is_chunked:
+            plan = chunk_download.build_plan(file_row.id)
+            if not plan:
+                return JSONResponse(status_code=404, content={"status": "error", "message": "File not found"})
+
+            client = await get_user_client(telegram_user_id, require_authorized=True)
+            file_size = file_row.file_size
+            disposition = "attachment" if download else "inline"
+            content_disp = _content_disposition(disposition, file_row.filename)
+
+            range_header = request.headers.get("Range")
+            if range_header and file_size:
+                try:
+                    range_val = range_header.replace("bytes=", "")
+                    start_str, end_str = range_val.split("-")
+                    start = int(start_str)
+                    end = int(end_str) if end_str else file_size - 1
+                    end = min(end, file_size - 1)
+                    content_length = end - start + 1
+
+                    async def chunked_range_iter() -> AsyncIterator[bytes]:
+                        async for data in chunk_download.stream_range(client, plan, start, end):
+                            yield data
+
+                    headers = {
+                        "Content-Range": f"bytes {start}-{end}/{file_size}",
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": str(content_length),
+                        "Content-Disposition": content_disp,
+                    }
+                    return StreamingResponse(chunked_range_iter(), status_code=206, media_type=file_row.mime_type, headers=headers)
+                except Exception as e:
+                    logger.warning(f"Chunked range parse error: {e}")
+
+            async def chunked_full_iter() -> AsyncIterator[bytes]:
+                async for data in chunk_download.stream_full(client, plan):
+                    yield data
+
+            headers = {
+                "Accept-Ranges": "bytes",
+                "Content-Disposition": content_disp,
+                "Cache-Control": "public, max-age=86400",
+                "ETag": f'"{file_row.id}"',
+            }
+            if file_size:
+                headers["Content-Length"] = str(file_size)
+            if request.headers.get("If-None-Match") == f'"{file_row.id}"':
+                return Response(status_code=304)
+
+            return StreamingResponse(chunked_full_iter(), media_type=file_row.mime_type, headers=headers)
+
+        msg_id = file_row.telegram_message_id
+
+        client = await get_user_client(telegram_user_id, require_authorized=True)
         message = await client.get_messages("me", ids=msg_id)
         if not message or not message.file:
             return JSONResponse(status_code=404, content={"status": "error", "message": "File not found"})
@@ -294,7 +406,7 @@ async def get_file(
         name = message.file.name or f"file_{msg_id}"
         file_size = message.file.size or 0
         disposition = "attachment" if download else "inline"
-        safe_name = name.replace('"', '_').replace('\r', '').replace('\n', '')
+        content_disp = _content_disposition(disposition, name)
 
         range_header = request.headers.get("Range")
         if range_header and file_size:
@@ -314,7 +426,7 @@ async def get_file(
                     "Content-Range": f"bytes {start}-{end}/{file_size}",
                     "Accept-Ranges": "bytes",
                     "Content-Length": str(chunk_size),
-                    "Content-Disposition": f'{disposition}; filename="{safe_name}"',
+                    "Content-Disposition": content_disp,
                 }
                 return StreamingResponse(range_iter(), status_code=206, media_type=mime, headers=headers)
             except Exception as e:
@@ -326,7 +438,7 @@ async def get_file(
 
         headers = {
             "Accept-Ranges": "bytes",
-            "Content-Disposition": f'{disposition}; filename="{safe_name}"',
+            "Content-Disposition": content_disp,
             "Cache-Control": "public, max-age=86400",
             "ETag": f'"{msg_id}"',
         }
@@ -337,6 +449,8 @@ async def get_file(
             return Response(status_code=304)
 
         return StreamingResponse(full_iter(), media_type=mime, headers=headers)
+    except SessionRevokedError:
+        raise
     except Exception as e:
         logger.error(f"GET FILE ERROR: {e}", exc_info=True)
         return JSONResponse(status_code=404, content={"status": "error", "message": "File not found"})
@@ -344,12 +458,30 @@ async def get_file(
 
 # ── Thumbnail ─────────────────────────────────────────────────────────────────
 
-@router.get("/thumbnail/{msg_id}")
+@router.get("/thumbnail/{file_id}")
 async def get_thumbnail(
-    msg_id: int,
+    file_id: str,
     request: Request,
     telegram_user_id: int = Depends(get_media_user),
 ):
+    try:
+        file_row = get_file_by_id(telegram_user_id, uuid.UUID(file_id))
+    except ValueError:
+        file_row = None
+    if not file_row:
+        return JSONResponse(status_code=404, content={"status": "error", "message": "Not found"})
+
+    if file_row.is_chunked:
+        # Best-effort: part 1 may or may not contain a decodable header depending on the
+        # container (e.g. mp4 moov atom placement) — falls through to the generic file
+        # icon on the frontend if Telegram has no thumbnail for it.
+        chunks = get_file_chunks_ordered(file_row.id)
+        if not chunks:
+            return JSONResponse(status_code=404, content={"status": "error", "message": "Not found"})
+        msg_id = chunks[0].telegram_message_id
+    else:
+        msg_id = file_row.telegram_message_id
+
     thumb_file = f"{telegram_user_id}_{msg_id}.jpg"
     thumb_path = os.path.join(os.path.abspath(THUMB_FOLDER), thumb_file)
 
@@ -358,7 +490,7 @@ async def get_thumbnail(
         return FileResponse(thumb_path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
 
     try:
-        client = await _get_telegram_client(telegram_user_id, require_authorized=True)
+        client = await get_user_client(telegram_user_id, require_authorized=True)
         message = await client.get_messages("me", ids=msg_id)
         if not message or not message.file:
             return JSONResponse(status_code=404, content={"status": "error", "message": "Not found"})
@@ -393,6 +525,8 @@ async def get_thumbnail(
 
         return Response(content=thumb_bytes, media_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=604800"})
+    except SessionRevokedError:
+        raise
     except Exception as e:
         logger.error(f"GET THUMBNAIL ERROR: {e}", exc_info=True)
         return JSONResponse(status_code=404, content={"status": "error", "message": "Not found"})
@@ -453,7 +587,7 @@ async def upload(
     failed: list[str] = []
 
     try:
-        client = await _get_telegram_client(telegram_user_id, require_authorized=True)
+        client = await get_user_client(telegram_user_id, require_authorized=True)
         for orig_name, path in saved:
             try:
                 msg = await client.send_file("me", path, force_document=True)
@@ -476,6 +610,11 @@ async def upload(
             finally:
                 if os.path.exists(path):
                     os.remove(path)
+    except SessionRevokedError:
+        for _, path in saved:
+            if os.path.exists(path):
+                os.remove(path)
+        raise
     except Exception as e:
         for _, path in saved:
             if os.path.exists(path):
@@ -496,7 +635,7 @@ async def upload(
 
 class MoveFilesBody(BaseModel):
     folder: str
-    msg_ids: list[int]
+    file_ids: list[str]
 
 
 @router.post("/files/move")
@@ -512,20 +651,25 @@ async def move_files(
     folder = sanitize_input(body.folder).strip()
     if not folder:
         return JSONResponse(status_code=400, content={"status": "error", "message": "Folder name is required"})
-    if not body.msg_ids:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "msg_ids must be a non-empty list"})
+    if not body.file_ids:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "file_ids must be a non-empty list"})
+
+    try:
+        file_ids = [uuid.UUID(x) for x in body.file_ids]
+    except ValueError:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid file id"})
 
     target_folder = add_folder(telegram_user_id, folder)
-    db_move_files(telegram_user_id, body.msg_ids, target_folder.id)
+    db_move_files(telegram_user_id, file_ids, target_folder.id)
     cache_invalidate(str(telegram_user_id))
-    log_security_event(request, "FILES_MOVED", f"moved={len(body.msg_ids)} to={folder}", str(telegram_user_id))
-    return {"status": "success", "moved": len(body.msg_ids), "failed": []}
+    log_security_event(request, "FILES_MOVED", f"moved={len(file_ids)} to={folder}", str(telegram_user_id))
+    return {"status": "success", "moved": len(file_ids), "failed": []}
 
 
 # ── Delete files ──────────────────────────────────────────────────────────────
 
 class DeleteFilesBody(BaseModel):
-    msg_ids: list[int]
+    file_ids: list[str]
 
 
 @router.delete("/files")
@@ -538,14 +682,20 @@ async def delete_files(
     if rl:
         return rl
 
-    if not body.msg_ids:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "msg_ids must be a non-empty list"})
+    if not body.file_ids:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "file_ids must be a non-empty list"})
 
     try:
-        client = await _get_telegram_client(telegram_user_id, require_authorized=True)
+        file_ids = [uuid.UUID(x) for x in body.file_ids]
+    except ValueError:
+        return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid file id"})
+
+    try:
+        client = await get_user_client(telegram_user_id, require_authorized=True)
+        message_ids = db_delete_files_by_ids(telegram_user_id, file_ids)
         deleted, failed = 0, []
-        for i in range(0, len(body.msg_ids), 100):
-            chunk = body.msg_ids[i: i + 100]
+        for i in range(0, len(message_ids), 100):
+            chunk = message_ids[i: i + 100]
             try:
                 await client.delete_messages("me", chunk)
                 deleted += len(chunk)
@@ -553,9 +703,7 @@ async def delete_files(
                 logger.error(f"DELETE chunk error: {e}")
                 failed.extend(chunk)
 
-        db_delete_files_by_ids(telegram_user_id, body.msg_ids)
-
-        for mid in body.msg_ids:
+        for mid in message_ids:
             tp = os.path.join(THUMB_FOLDER, f"{telegram_user_id}_{mid}.jpg")
             if os.path.exists(tp):
                 os.remove(tp)
@@ -563,6 +711,8 @@ async def delete_files(
         cache_invalidate(str(telegram_user_id))
         log_security_event(request, "FILES_DELETED", f"deleted={deleted}", str(telegram_user_id))
         return {"status": "success", "deleted": deleted, "failed": failed}
+    except SessionRevokedError:
+        raise
     except Exception as e:
         logger.error(f"DELETE FILES ERROR: {e}")
         return JSONResponse(status_code=500, content={"status": "error", "message": "Failed to delete files"})

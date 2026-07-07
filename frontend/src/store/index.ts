@@ -26,8 +26,8 @@ interface AppState {
   setScanned: (n: number | null) => void
 
   // Selection
-  selectedIds: Set<number>
-  toggleSelect: (id: number) => void
+  selectedIds: Set<string>
+  toggleSelect: (id: string) => void
   selectAll: () => void
   clearSelection: () => void
 
