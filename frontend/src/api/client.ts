@@ -248,8 +248,28 @@ export const completeUploadSession = (sessionId: string) => post(`/uploads/${ses
 
 export const abortUploadSession = (sessionId: string) => del(`/uploads/${sessionId}`)
 
+export type UploadProgressFn = (pct: number, loaded: number, total: number) => void
+
+/** Smoothed browser→server upload speed from XHR progress events. Returns bytes/second
+ * (0 until there are two samples to compare). */
+export function makeSpeedTracker(): (loaded: number) => number {
+  let lastTime = 0
+  let lastLoaded = 0
+  let speed = 0
+  return (loaded: number): number => {
+    const now = performance.now()
+    if (lastTime && now > lastTime) {
+      const inst = ((loaded - lastLoaded) / (now - lastTime)) * 1000
+      speed = speed ? 0.2 * inst + 0.8 * speed : inst
+    }
+    lastTime = now
+    lastLoaded = loaded
+    return speed
+  }
+}
+
 export const uploadPart = (
-  sessionId: string, partNumber: number, blob: Blob, onProgress?: (pct: number) => void,
+  sessionId: string, partNumber: number, blob: Blob, onProgress?: UploadProgressFn,
 ): Promise<Response> => {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
@@ -260,7 +280,7 @@ export const uploadPart = (
 
     if (onProgress) {
       xhr.upload.onprogress = e => {
-        if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100))
+        if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100), e.loaded, e.total)
       }
     }
 
@@ -270,7 +290,7 @@ export const uploadPart = (
   })
 }
 
-export const uploadFiles = (folder: string, files: File[], onProgress?: (pct: number) => void): Promise<Response> => {
+export const uploadFiles = (folder: string, files: File[], onProgress?: UploadProgressFn): Promise<Response> => {
   return new Promise((resolve, reject) => {
     const form = new FormData()
     form.append('folderName', folder)
@@ -283,7 +303,7 @@ export const uploadFiles = (folder: string, files: File[], onProgress?: (pct: nu
 
     if (onProgress) {
       xhr.upload.onprogress = e => {
-        if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100))
+        if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100), e.loaded, e.total)
       }
     }
 

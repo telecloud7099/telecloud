@@ -419,7 +419,9 @@ async def get_file(
                 chunk_size = end - start + 1
 
                 async def range_iter() -> AsyncIterator[bytes]:
-                    async for chunk in client.iter_download(message.media, offset=start, limit=chunk_size):
+                    # iter_download's `limit` counts requests, not bytes — iter_exact
+                    # yields exactly the requested byte window.
+                    async for chunk in chunk_download.iter_exact(client, message.media, start, chunk_size):
                         yield chunk
 
                 headers = {
@@ -433,7 +435,7 @@ async def get_file(
                 logger.warning(f"Range parse error: {e}")
 
         async def full_iter() -> AsyncIterator[bytes]:
-            async for chunk in client.iter_download(message.media):
+            async for chunk in client.iter_download(message.media, request_size=chunk_download.REQUEST_SIZE):
                 yield chunk
 
         headers = {

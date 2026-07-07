@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { uploadFiles, safeJson } from '../api/client'
+import { uploadFiles, safeJson, makeSpeedTracker } from '../api/client'
 import { uploadChunkedFile, NotChunkedError, type ChunkedUploadProgress } from '../api/chunkedUpload'
 import { useStore } from '../store'
 
@@ -16,6 +16,12 @@ const CHUNK_PROBE_THRESHOLD = 1900 * 1024 * 1024
 
 interface ChunkedFileProgress extends ChunkedUploadProgress {
   fileName: string
+}
+
+interface BatchProgress {
+  pct: number
+  speedBps?: number
+  etaSeconds?: number
 }
 
 function fmtSpeed(bps?: number): string | null {
@@ -36,7 +42,7 @@ export default function UploadZone({ onUploaded }: Props) {
   const [folder, setFolder] = useState('')
   const [pending, setPending] = useState<File[]>([])
   const [uploading, setUploading] = useState(false)
-  const [progress, setProgress] = useState(0)
+  const [progress, setProgress] = useState<BatchProgress>({ pct: 0 })
   const [chunkedProgress, setChunkedProgress] = useState<ChunkedFileProgress | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
@@ -46,7 +52,15 @@ export default function UploadZone({ onUploaded }: Props) {
   }
 
   async function uploadSmallBatch(files: File[]) {
-    const res = await uploadFiles(folder, files, pct => setProgress(pct))
+    const speedOf = makeSpeedTracker()
+    const res = await uploadFiles(folder, files, (pct, loaded, total) => {
+      const bps = speedOf(loaded)
+      setProgress({
+        pct,
+        speedBps: bps || undefined,
+        etaSeconds: bps > 0 ? Math.round((total - loaded) / bps) : undefined,
+      })
+    })
     const d = await safeJson(res, 'Upload')
 
     const results: { name: string; success: boolean; error?: string }[] =
@@ -63,7 +77,7 @@ export default function UploadZone({ onUploaded }: Props) {
     e.preventDefault()
     if (!pending.length) return
     setUploading(true)
-    setProgress(0)
+    setProgress({ pct: 0 })
     setChunkedProgress(null)
 
     const smallFiles = pending.filter(f => f.size <= CHUNK_PROBE_THRESHOLD)
@@ -94,7 +108,7 @@ export default function UploadZone({ onUploaded }: Props) {
       toast.error('Upload failed — network error')
     } finally {
       setUploading(false)
-      setProgress(0)
+      setProgress({ pct: 0 })
       setChunkedProgress(null)
     }
   }
@@ -137,7 +151,15 @@ export default function UploadZone({ onUploaded }: Props) {
 
       {uploading && (
         <div className="progress-bar">
-          <div className="progress-fill" style={{ width: `${chunkedProgress ? chunkedProgress.overallPct : progress}%` }} />
+          <div className="progress-fill" style={{ width: `${chunkedProgress ? chunkedProgress.overallPct : progress.pct}%` }} />
+        </div>
+      )}
+
+      {uploading && !chunkedProgress && progress.pct > 0 && (
+        <div className="progress-text">
+          Uploading… {progress.pct}%
+          {fmtSpeed(progress.speedBps) && ` · ${fmtSpeed(progress.speedBps)}`}
+          {fmtEta(progress.etaSeconds) && ` · ETA ${fmtEta(progress.etaSeconds)}`}
         </div>
       )}
 
@@ -145,7 +167,11 @@ export default function UploadZone({ onUploaded }: Props) {
         <div className="progress-text">
           <div>{chunkedProgress.fileName}</div>
           {chunkedProgress.phase === 'sending' && (
-            <div>Receiving file… {chunkedProgress.partPct}%</div>
+            <div>
+              Receiving file… {chunkedProgress.partPct}%
+              {fmtSpeed(chunkedProgress.speedBps) && ` · ${fmtSpeed(chunkedProgress.speedBps)}`}
+              {fmtEta(chunkedProgress.etaSeconds) && ` · ETA ${fmtEta(chunkedProgress.etaSeconds)}`}
+            </div>
           )}
           {chunkedProgress.phase === 'telegram' && (
             <>
@@ -171,7 +197,7 @@ export default function UploadZone({ onUploaded }: Props) {
             <span className="material-symbols-rounded spin" style={{ fontSize: '1rem' }}>
               progress_activity
             </span>
-            {chunkedProgress ? chunkedProgress.overallPct : progress}%
+            {chunkedProgress ? chunkedProgress.overallPct : progress.pct}%
           </>
         ) : (
           <>

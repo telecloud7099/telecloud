@@ -1,4 +1,4 @@
-import { createUploadSession, getUploadSession, uploadPart, completeUploadSession, safeJson } from './client'
+import { createUploadSession, getUploadSession, uploadPart, completeUploadSession, safeJson, makeSpeedTracker } from './client'
 
 /** Thrown when the backend decides a file fits in a single Telegram document after all
  * (e.g. a Premium account's larger cap) — the caller should fall back to the plain upload. */
@@ -100,13 +100,17 @@ export async function uploadChunkedFile(
 
           let res: Response
           try {
-            res = await uploadPart(sessionId, part, blob, pct =>
+            const speedOf = makeSpeedTracker()
+            res = await uploadPart(sessionId, part, blob, (pct, loaded, total) => {
+              const bps = speedOf(loaded)
               onProgress({
                 phase: 'sending', partNumber: part, totalParts: totalChunks,
                 partPct: pct,
                 overallPct: pctOf(confirmedBefore, file.size),
-              }),
-            )
+                speedBps: bps || undefined,
+                etaSeconds: bps > 0 ? Math.round((total - loaded) / bps) : undefined,
+              })
+            })
           } catch (err) {
             // Network-level XHR failure — the server may still have received and kept the
             // part, so this is retryable: the next attempt checks serverHasPart first.

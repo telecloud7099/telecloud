@@ -4,12 +4,25 @@ to a temp file — bytes flow straight from Telegram to the HTTP response, same 
 existing single-message download path.
 """
 import logging
+import time
 from typing import AsyncIterator, Optional
 from uuid import UUID
 
 from backend.database import get_file_chunks_ordered, FileChunk
 
 logger = logging.getLogger(__name__)
+
+# Telegram's per-request ceiling. Every request is a full round trip to the DC, so on a
+# high-latency link (e.g. a deployed backend far from the account's home DC) request size
+# directly sets the streaming throughput ceiling — 1 MiB halves the round trips vs
+# Telethon's 512 KiB default.
+REQUEST_SIZE = 1024 * 1024
+
+# message_id -> (expires_at, media). A playing video issues many Range requests, and each
+# used to cost a get_messages round trip before the first byte could flow. File references
+# inside media expire server-side (~1h), so entries are kept well under that.
+_media_cache: dict[int, tuple[float, object]] = {}
+_MEDIA_TTL_SECONDS = 300
 
 
 class ChunkPlan:
@@ -33,13 +46,18 @@ def build_plan(file_id: UUID) -> Optional[ChunkPlan]:
 
 
 async def _get_media(client, chunk: FileChunk):
+    cached = _media_cache.get(chunk.telegram_message_id)
+    if cached and cached[0] > time.monotonic():
+        return cached[1]
+
     message = await client.get_messages("me", ids=chunk.telegram_message_id)
     if not message or not message.file:
         raise Exception(f"Chunk part {chunk.part_number} (message {chunk.telegram_message_id}) is unavailable")
+    _media_cache[chunk.telegram_message_id] = (time.monotonic() + _MEDIA_TTL_SECONDS, message.media)
     return message.media
 
 
-async def _iter_exact(client, media, offset: int, length: int) -> AsyncIterator[bytes]:
+async def iter_exact(client, media, offset: int, length: int) -> AsyncIterator[bytes]:
     """Yields exactly `length` bytes starting at `offset` within `media`.
 
     Telethon's `iter_download` is lazy — it only makes a network request when asked for
@@ -50,7 +68,7 @@ async def _iter_exact(client, media, offset: int, length: int) -> AsyncIterator[
     if length <= 0:
         return
     remaining = length
-    async for data in client.iter_download(media, offset=offset):
+    async for data in client.iter_download(media, offset=offset, request_size=REQUEST_SIZE):
         if len(data) >= remaining:
             yield data[:remaining]
             return
@@ -62,7 +80,7 @@ async def stream_full(client, plan: ChunkPlan) -> AsyncIterator[bytes]:
     """Streams every chunk in order, start to finish."""
     for chunk in plan.chunks:
         media = await _get_media(client, chunk)
-        async for data in client.iter_download(media):
+        async for data in client.iter_download(media, request_size=REQUEST_SIZE):
             yield data
 
 
@@ -79,5 +97,5 @@ async def stream_range(client, plan: ChunkPlan, start: int, end: int) -> AsyncIt
         local_length = local_end - local_start + 1
 
         media = await _get_media(client, chunk)
-        async for data in _iter_exact(client, media, local_start, local_length):
+        async for data in iter_exact(client, media, local_start, local_length):
             yield data
