@@ -2,17 +2,20 @@ import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { uploadFiles, safeJson, makeSpeedTracker } from '../api/client'
 import { uploadChunkedFile, NotChunkedError, type ChunkedUploadProgress } from '../api/chunkedUpload'
-import { useStore } from '../store'
+import { useStore, WIDGET_LINGER_MS } from '../store'
+import type { UploadItem } from '../store'
+import { fmtSpeed, fmtEta } from '../utils/format'
 
 interface Props {
   onUploaded: () => void
 }
 
-// Smaller of Telegram's two per-account document caps (free vs. Premium) — anything under
-// this is guaranteed to fit in one document regardless of account type, so it's not worth
-// the extra round-trip of asking the backend. Anything at or above it might still turn out
-// to fit (a Premium account's larger cap), in which case NotChunkedError signals a fallback.
-const CHUNK_PROBE_THRESHOLD = 1900 * 1024 * 1024
+// Files at or above this size go through the durable, resumable upload-session flow
+// instead of a single plain POST — matches the backend's RESUMABLE_THRESHOLD. That's what
+// lets an upload survive a page refresh and retry just the failed part on a network blip,
+// rather than losing (or fully re-sending) the whole file. Below it, a file is small/quick
+// enough that a full-request retry (see uploadFiles in client.ts) is cheap enough on its own.
+const CHUNK_PROBE_THRESHOLD = 10 * 1024 * 1024
 
 interface ChunkedFileProgress extends ChunkedUploadProgress {
   fileName: string
@@ -24,21 +27,12 @@ interface BatchProgress {
   etaSeconds?: number
 }
 
-function fmtSpeed(bps?: number): string | null {
-  if (!bps) return null
-  const mbps = bps / (1024 * 1024)
-  return mbps >= 1 ? `${mbps.toFixed(1)} MB/s` : `${Math.round(bps / 1024)} KB/s`
-}
-
-function fmtEta(seconds?: number): string | null {
-  if (seconds == null) return null
-  const m = Math.floor(seconds / 60)
-  const s = seconds % 60
-  return m > 0 ? `${m}m ${s}s` : `${s}s`
-}
-
 export default function UploadZone({ onUploaded }: Props) {
   const folders = useStore(s => s.folders)
+  const addUpload = useStore(s => s.addUpload)
+  const updateUpload = useStore(s => s.updateUpload)
+  const removeUpload = useStore(s => s.removeUpload)
+  const renameUploadId = useStore(s => s.renameUploadId)
   const [folder, setFolder] = useState('')
   const [pending, setPending] = useState<File[]>([])
   const [uploading, setUploading] = useState(false)
@@ -51,16 +45,29 @@ export default function UploadZone({ onUploaded }: Props) {
     setPending([...e.dataTransfer.files])
   }
 
+  function finishWidget(id: string, patch: Partial<UploadItem>) {
+    updateUpload(id, patch)
+    setTimeout(() => removeUpload(id), WIDGET_LINGER_MS)
+  }
+
   async function uploadSmallBatch(files: File[]) {
+    const widgetId = crypto.randomUUID()
+    const label = files.length === 1 ? files[0].name : `${files.length} files`
+    addUpload({ id: widgetId, fileName: label, folderName: folder, status: 'uploading', phase: 'batch', pct: 0, startedAt: Date.now() })
+
     const speedOf = makeSpeedTracker()
-    const res = await uploadFiles(folder, files, (pct, loaded, total) => {
-      const bps = speedOf(loaded)
-      setProgress({
-        pct,
-        speedBps: bps || undefined,
-        etaSeconds: bps > 0 ? Math.round((total - loaded) / bps) : undefined,
+    let res: Response
+    try {
+      res = await uploadFiles(folder, files, (pct, loaded, total) => {
+        const bps = speedOf(loaded)
+        const etaSeconds = bps > 0 ? Math.round((total - loaded) / bps) : undefined
+        setProgress({ pct, speedBps: bps || undefined, etaSeconds })
+        updateUpload(widgetId, { pct, speedBps: bps || undefined, etaSeconds })
       })
-    })
+    } catch (err) {
+      finishWidget(widgetId, { status: 'error', error: 'Network error' })
+      throw err
+    }
     const d = await safeJson(res, 'Upload')
 
     const results: { name: string; success: boolean; error?: string }[] =
@@ -71,6 +78,10 @@ export default function UploadZone({ onUploaded }: Props) {
 
     if (ok > 0) toast.success(`${ok} file${ok !== 1 ? 's' : ''} uploaded`)
     fail.forEach(r => toast.error(`Failed: ${r.name}${r.error ? ` — ${r.error}` : ''}`))
+
+    finishWidget(widgetId, fail.length && !ok
+      ? { status: 'error', error: fail[0]?.error || 'Upload failed' }
+      : { status: 'done', pct: 100 })
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -89,15 +100,38 @@ export default function UploadZone({ onUploaded }: Props) {
       }
 
       for (const f of largeFiles) {
+        // Widget entry starts under a throwaway id; renamed to the real session id as
+        // soon as one exists so a page refresh can find and reattach to the same entry.
+        let activeId: string = crypto.randomUUID()
+        addUpload({ id: activeId, fileName: f.name, folderName: folder, status: 'uploading', phase: 'sending', pct: 0, startedAt: Date.now() })
         try {
-          await uploadChunkedFile(f, folder, p => setChunkedProgress({ fileName: f.name, ...p }))
+          await uploadChunkedFile(
+            f, folder,
+            p => {
+              setChunkedProgress({ fileName: f.name, ...p })
+              updateUpload(activeId, {
+                phase: p.phase, pct: p.overallPct, speedBps: p.speedBps, etaSeconds: p.etaSeconds,
+                partNumber: p.partNumber, totalParts: p.totalParts,
+              })
+            },
+            sessionId => {
+              if (sessionId !== activeId) {
+                renameUploadId(activeId, sessionId)
+                activeId = sessionId
+              }
+            },
+          )
           toast.success(`${f.name} uploaded`)
+          finishWidget(activeId, { status: 'done', pct: 100 })
         } catch (err) {
           if (err instanceof NotChunkedError) {
             // Backend decided this file fits in one Telegram document after all.
+            removeUpload(activeId)
             await uploadSmallBatch([f])
           } else {
-            toast.error(`Failed: ${f.name}${err instanceof Error ? ` — ${err.message}` : ''}`)
+            const message = err instanceof Error ? err.message : 'Upload failed'
+            toast.error(`Failed: ${f.name} — ${message}`)
+            finishWidget(activeId, { status: 'error', error: message })
           }
         }
       }

@@ -43,6 +43,7 @@ export async function uploadChunkedFile(
   file: File,
   folderName: string,
   onProgress: (p: ChunkedUploadProgress) => void,
+  onSessionId?: (id: string) => void,
 ): Promise<void> {
   const key = resumeKey(file)
   let sessionId = localStorage.getItem(key)
@@ -73,7 +74,7 @@ export async function uploadChunkedFile(
     const created = await safeJson(await createUploadSession(
       file.name, file.size, file.type || 'application/octet-stream', folderName,
     ), 'Starting upload')
-    if (created.status !== 'success') throw new Error('Could not start upload')
+    if (created.status !== 'success') throw new Error(created.message || 'Could not start upload')
     if (!created.chunked) throw new NotChunkedError()
 
     sessionId = created.session_id ?? null
@@ -83,6 +84,8 @@ export async function uploadChunkedFile(
     if (!sessionId) throw new Error('Upload session response missing session_id')
     localStorage.setItem(key, sessionId)
   }
+
+  onSessionId?.(sessionId)
 
   for (let part = nextPart; part <= totalChunks; part++) {
     // Parts confirm strictly in order, so everything before this part is already on Telegram.
@@ -124,7 +127,12 @@ export async function uploadChunkedFile(
         await waitForPartConfirmed(sessionId, part, totalChunks, file.size, onProgress)
         break
       } catch (err) {
-        if (err instanceof PartRetryableError && attempt < MAX_PART_ATTEMPTS) continue
+        if (err instanceof PartRetryableError && attempt < MAX_PART_ATTEMPTS) {
+          // A brief network blip needs a moment to clear before hammering the same
+          // request again — back off a little longer on each successive attempt.
+          await sleep(attempt * 1000)
+          continue
+        }
         throw err
       }
     }
@@ -205,4 +213,73 @@ async function serverHasPart(sessionId: string, part: number): Promise<boolean> 
 function pctOf(done: number, total: number): number {
   if (!total) return 0
   return Math.min(100, Math.round((done / total) * 100))
+}
+
+export interface WatchedSessionState {
+  sessionStatus: string
+  phase: 'sending' | 'telegram' | 'paused'
+  pct: number
+  partNumber: number
+  totalParts: number
+  speedBps?: number
+  etaSeconds?: number
+}
+
+/** Passive, read-only observer for a chunked upload session this tab didn't start —
+ * e.g. one recovered after a page refresh. Never sends bytes; just polls status so the
+ * widget can show live progress for whatever the background Telegram push is doing, and
+ * reports back once the session leaves the "uploading" state (or disappears).
+ * Returns a stop function — call it to cancel polling (e.g. on unmount, or once the same
+ * file is re-picked and a real uploadChunkedFile() call takes over driving this session). */
+export function watchUploadSession(
+  sessionId: string,
+  totalSize: number,
+  onUpdate: (s: WatchedSessionState) => void,
+  onEnded: (finalStatus: string) => void,
+): () => void {
+  let stopped = false
+
+  ;(async () => {
+    while (!stopped) {
+      const res = await getUploadSession(sessionId).catch(() => null)
+      if (stopped) return
+      if (!res || res.status === 404) { onEnded('gone'); return }
+
+      let status: any = null
+      try {
+        status = await safeJson(res, 'Checking upload progress')
+      } catch {
+        // Unreadable body — treat as a transient blip and just poll again.
+      }
+      if (stopped) return
+      if (!status || status.status !== 'success') { await sleep(POLL_INTERVAL_MS); continue }
+      if (status.session_status !== 'uploading') { onEnded(status.session_status); return }
+
+      const p = status.part_progress
+      if (p && p.phase !== 'failed') {
+        onUpdate({
+          sessionStatus: status.session_status,
+          phase: p.phase === 'receiving' ? 'sending' : 'telegram',
+          partNumber: p.part_number,
+          totalParts: status.total_chunks,
+          pct: pctOf((status.bytes_uploaded ?? 0) + (p.bytes_done ?? 0), totalSize),
+          speedBps: p.speed_bps || undefined,
+          etaSeconds: p.eta_seconds ?? undefined,
+        })
+      } else {
+        // No live part in flight — the backend is idle, waiting for this tab (or another)
+        // to send the next part. Nothing to watch but bytes-so-far.
+        onUpdate({
+          sessionStatus: status.session_status,
+          phase: 'paused',
+          partNumber: status.next_part_number,
+          totalParts: status.total_chunks,
+          pct: pctOf(status.bytes_uploaded ?? 0, totalSize),
+        })
+      }
+      await sleep(POLL_INTERVAL_MS)
+    }
+  })()
+
+  return () => { stopped = true }
 }

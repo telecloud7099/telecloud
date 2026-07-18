@@ -825,6 +825,9 @@ a:hover { color: #cca4ff; text-decoration: underline; }
   /* Header — hide phone number */
   .header-phone { display: none; }
 
+  /* Upload widget — sit above the mobile bottom nav */
+  .upload-widget { bottom: calc(16px + 68px); left: 8px; right: 8px; width: auto; }
+
   /* Confirm modal — bottom sheet */
   .modal-backdrop { align-items: flex-end; }
   .modal-box {
@@ -867,6 +870,53 @@ a:hover { color: #cca4ff; text-decoration: underline; }
     font-variation-settings: 'FILL' 1, 'wght' 500, 'GRAD' 0, 'opsz' 24;
   }
 }
+
+/* ── Upload progress widget (fixed, persists until uploads finish) ──────── */
+.upload-widget {
+  position: fixed; left: 16px; bottom: 16px; z-index: 900;
+  width: 300px; max-width: calc(100vw - 32px);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; box-shadow: 0 10px 40px -10px rgba(0,0,0,0.5);
+  overflow: hidden; animation: fadeIn 0.25s ease-out;
+}
+.upload-widget-header {
+  display: flex; align-items: center; gap: 6px;
+  padding: 10px 14px; font-size: 0.82rem; font-weight: 600;
+  color: var(--text-muted); border-bottom: 1px solid var(--border);
+}
+.upload-widget-list {
+  display: flex; flex-direction: column;
+  max-height: 260px; overflow-y: auto;
+}
+.upload-widget-item {
+  padding: 10px 14px; cursor: pointer; transition: background 0.15s;
+  border-bottom: 1px solid var(--border);
+}
+.upload-widget-item:last-child { border-bottom: none; }
+.upload-widget-item:hover { background: var(--hover); }
+.upload-widget-item-top { display: flex; align-items: center; gap: 6px; }
+.upload-widget-item-icon { font-size: 1.05rem; opacity: 0.7; flex-shrink: 0; }
+.upload-widget-item-uploading .upload-widget-item-icon { color: var(--accent); animation: spin 1.2s linear infinite; }
+.upload-widget-item-done .upload-widget-item-icon { color: var(--success); }
+.upload-widget-item-error .upload-widget-item-icon { color: var(--error); }
+.upload-widget-item-paused .upload-widget-item-icon { color: var(--warning); animation: none; }
+.upload-widget-item-hint { color: var(--warning); }
+.upload-widget-item-name {
+  flex: 1; font-size: 0.85rem; font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.upload-widget-item-close {
+  background: none; border: none; color: var(--text-muted); cursor: pointer;
+  padding: 2px; display: flex; opacity: 0.6; flex-shrink: 0;
+}
+.upload-widget-item-close:hover { opacity: 1; }
+.upload-widget-item-close .material-symbols-rounded { font-size: 1rem; }
+.upload-widget-progress { margin-top: 8px; }
+.upload-widget-item-meta {
+  font-size: 0.75rem; color: var(--text-muted); margin-top: 5px;
+}
+.upload-widget-item-error { color: var(--error); }
+.upload-widget-item-elapsed { margin-top: 2px; opacity: 0.7; }
 
 @media (max-width: 480px) {
   .card { padding: 0.8rem; }

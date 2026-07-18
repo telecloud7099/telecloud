@@ -664,6 +664,36 @@ def get_stale_upload_sessions(older_than: datetime, status: str = "uploading") -
         )).all()
 
 
+def get_active_upload_sessions(telegram_user_id: int) -> list[dict]:
+    """Every upload session still in progress for this user — lets the frontend reattach
+    its progress widget to a chunked upload whose background Telegram push survives a
+    page refresh, even though the browser-side JS driving it does not."""
+    with Session(engine) as s:
+        stmt = (
+            select(UploadSession, Folder.name.label("folder_name"))
+            .outerjoin(Folder, UploadSession.folder_id == Folder.id)
+            .where(
+                UploadSession.telegram_user_id == telegram_user_id,
+                UploadSession.status == "uploading",
+            )
+            .order_by(UploadSession.created_at.desc())
+        )
+        rows = s.exec(stmt).all()
+        return [
+            {
+                "session_id": str(session.id),
+                "filename": session.filename,
+                "folder_name": folder_name,
+                "next_part_number": session.next_part_number,
+                "total_chunks": session.total_chunks,
+                "chunk_size": session.chunk_size,
+                "bytes_uploaded": session.bytes_uploaded,
+                "total_size": session.total_size,
+            }
+            for session, folder_name in rows
+        ]
+
+
 def get_confirmed_chunks(session_id: UUID) -> list[FileChunk]:
     with Session(engine) as s:
         return s.exec(select(FileChunk).where(

@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 FREE_CHUNK_SIZE = 1900 * 1024 * 1024
 PREMIUM_CHUNK_SIZE = 3900 * 1024 * 1024
 
+# Any file at or above this size gets a durable UploadSession — independent of whether it
+# actually needs multiple Telegram documents. Below Telegram's own cap this just means a
+# session with a single part/document (same Telegram-side footprint as before), but wrapping
+# it in a session is what makes the upload survive a page refresh and retry a failed part
+# instead of the whole file. Small/quick files stay on the plain single-shot endpoint, where
+# a full-request retry is cheap enough not to need this machinery.
+RESUMABLE_THRESHOLD = int(os.getenv("RESUMABLE_UPLOAD_THRESHOLD_MB", "10") or "10") * 1024 * 1024
+
 # Generous window so a legitimately slow/paused upload is never killed prematurely —
 # this only reaps sessions truly abandoned by the client.
 SESSION_EXPIRE_SECONDS = int(os.getenv("UPLOAD_SESSION_EXPIRE_SECONDS", str(7 * 24 * 3600)))
@@ -52,6 +60,13 @@ async def get_chunk_size(client, telegram_user_id: int) -> int:
 
 def needs_chunking(total_size: int, chunk_size: int) -> bool:
     return total_size > chunk_size
+
+
+def needs_session(total_size: int) -> bool:
+    """Whether this upload should go through the durable, resumable session flow at all
+    (see RESUMABLE_THRESHOLD) — a separate question from needs_chunking, which is only
+    about whether it takes more than one Telegram document."""
+    return total_size >= RESUMABLE_THRESHOLD
 
 
 def start_session(

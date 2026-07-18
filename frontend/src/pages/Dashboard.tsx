@@ -1,16 +1,18 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Toaster, toast } from 'sonner'
-import { useStore } from '../store'
+import { useStore, WIDGET_LINGER_MS } from '../store'
 import {
   getMe, logout, listFolders, getFolderCounts, listFiles,
   listFilesInFolder, getFileStats, createFolder,
-  moveFiles, deleteFiles, syncFiles, clearToken,
+  moveFiles, deleteFiles, syncFiles, clearToken, listUploadSessions,
 } from '../api/client'
-import type { TeleFile } from '../api/client'
+import type { TeleFile, ActiveUploadSession } from '../api/client'
+import { watchUploadSession } from '../api/chunkedUpload'
 import FolderGrid from '../components/FolderGrid'
 import FileGrid from '../components/FileGrid'
 import UploadZone from '../components/UploadZone'
+import UploadWidget from '../components/UploadWidget'
 import Gallery from '../components/Gallery'
 import PreviewModal from '../components/PreviewModal'
 import SearchBar from '../components/SearchBar'
@@ -43,7 +45,10 @@ export default function Dashboard() {
     view, setView,
     currentFolder, setCurrentFolder,
     setLoading,
+    addUpload, updateUpload, removeUpload,
   } = useStore()
+
+  const uploadWatchersRef = useRef<Map<string, () => void>>(new Map())
 
   const [totalFiles, setTotalFiles] = useState(0)
   const [totalSize, setTotalSize] = useState(0)
@@ -75,8 +80,87 @@ export default function Dashboard() {
 
     loadFolders()
     loadStats()
-    loadAllFiles(true)
+
+    // The view (All Files / a specific folder) survives a page refresh via persisted
+    // store state, but the file list itself doesn't — refetch whichever one is active
+    // so a just-uploaded file is still visible after a reload instead of only showing
+    // up once the user re-navigates.
+    if (view === 'folder' && currentFolder) {
+      loadFolderFiles(currentFolder)
+    } else if (view === 'search') {
+      // No persisted query to re-run — fall back to All Files rather than showing an
+      // empty search view.
+      setView('all')
+      loadAllFiles(true)
+    } else {
+      loadAllFiles(true)
+    }
+
+    reattachActiveUploads()
+
+    return () => {
+      uploadWatchersRef.current.forEach(stop => stop())
+      uploadWatchersRef.current.clear()
+    }
   }, [])
+
+  // ── Reattach the upload widget to any chunked upload still running server-side ──────
+  // A chunked upload's background Telegram push survives a page refresh even though the
+  // browser JS driving it doesn't. Without this, the widget would just vanish on refresh
+  // even while the backend keeps working — this rebuilds a live entry for it and polls
+  // (read-only) so speed/ETA/part progress keep showing until it finishes.
+  async function reattachActiveUploads() {
+    try {
+      const res = await listUploadSessions()
+      const d = await res.json()
+      if (d.status !== 'success') return
+
+      for (const session of d.sessions as ActiveUploadSession[]) {
+        const id = session.session_id
+        const pct = session.total_size
+          ? Math.min(100, Math.round((session.bytes_uploaded / session.total_size) * 100))
+          : 0
+
+        addUpload({
+          id,
+          fileName: session.filename,
+          folderName: session.folder_name ?? '',
+          status: 'uploading',
+          phase: 'paused',
+          pct,
+          partNumber: session.next_part_number,
+          totalParts: session.total_chunks,
+          recovered: true,
+          // True start time isn't known post-refresh — elapsed shows time-since-reattached.
+          startedAt: Date.now(),
+        })
+
+        const stop = watchUploadSession(
+          id, session.total_size,
+          upd => updateUpload(id, {
+            phase: upd.phase, pct: upd.pct, speedBps: upd.speedBps, etaSeconds: upd.etaSeconds,
+            partNumber: upd.partNumber, totalParts: upd.totalParts,
+          }),
+          finalStatus => {
+            uploadWatchersRef.current.delete(id)
+            if (finalStatus === 'completed') {
+              updateUpload(id, { status: 'done', pct: 100 })
+              setTimeout(() => removeUpload(id), WIDGET_LINGER_MS)
+              loadFolders()
+            } else if (finalStatus === 'aborted') {
+              removeUpload(id)
+            } else {
+              updateUpload(id, { status: 'error', error: 'Upload stopped' })
+              setTimeout(() => removeUpload(id), WIDGET_LINGER_MS)
+            }
+          },
+        )
+        uploadWatchersRef.current.set(id, stop)
+      }
+    } catch {
+      // Non-critical — the widget just won't show a recovered upload this time.
+    }
+  }
 
   // ── Sync on tab focus (visibility change) ────────────────────────────────
   useEffect(() => {
@@ -583,6 +667,8 @@ export default function Dashboard() {
           onCancel={() => setConfirmDelete(false)}
         />
       )}
+
+      <UploadWidget onNavigate={folderName => folderName ? openFolder(folderName) : openAllFiles()} />
     </>
   )
 }

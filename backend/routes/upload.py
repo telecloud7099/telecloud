@@ -7,7 +7,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from backend.auth import get_current_user
-from backend.database import add_folder, get_confirmed_chunks, finalize_chunked_file, UploadSession
+from backend.database import (
+    add_folder, get_confirmed_chunks, finalize_chunked_file, UploadSession,
+    get_active_upload_sessions,
+)
 from backend.telegram_client import get_user_client, SessionRevokedError
 from backend.security import rate_limit_check, sanitize_input, log_security_event
 from backend.cache import cache_invalidate
@@ -68,9 +71,9 @@ async def create_upload_session_route(
 
     chunk_size = await upload_sessions.get_chunk_size(client, telegram_user_id)
 
-    if not upload_sessions.needs_chunking(body.total_size, chunk_size):
-        # Small enough for a single Telegram document — caller should use the existing
-        # single-shot /upload endpoint instead. No session is created.
+    if not upload_sessions.needs_session(body.total_size):
+        # Small/quick enough that a durable session isn't worth it — caller should use the
+        # existing single-shot /upload endpoint instead. No session is created.
         return {"status": "success", "chunked": False, "chunk_size": chunk_size}
 
     folder_name = sanitize_input(body.folder_name)
@@ -90,6 +93,15 @@ async def create_upload_session_route(
         "chunked": True,
         **upload_sessions.session_status_dict(session),
     }
+
+
+@router.get("/uploads")
+async def list_upload_sessions_route(
+    telegram_user_id: int = Depends(get_current_user),
+):
+    """Active (still-uploading) sessions for this user — used to reattach the upload
+    widget to an in-progress chunked upload after a page refresh."""
+    return {"status": "success", "sessions": get_active_upload_sessions(telegram_user_id)}
 
 
 @router.get("/uploads/{session_id}")

@@ -244,6 +244,19 @@ export const createUploadSession = (filename: string, totalSize: number, mimeTyp
 
 export const getUploadSession = (sessionId: string) => apiFetch(`/uploads/${sessionId}`)
 
+export interface ActiveUploadSession {
+  session_id: string
+  filename: string
+  folder_name: string | null
+  next_part_number: number
+  total_chunks: number
+  chunk_size: number
+  bytes_uploaded: number
+  total_size: number
+}
+
+export const listUploadSessions = () => apiFetch('/uploads')
+
 export const completeUploadSession = (sessionId: string) => post(`/uploads/${sessionId}/complete`, {})
 
 export const abortUploadSession = (sessionId: string) => del(`/uploads/${sessionId}`)
@@ -290,7 +303,13 @@ export const uploadPart = (
   })
 }
 
-export const uploadFiles = (folder: string, files: File[], onProgress?: UploadProgressFn): Promise<Response> => {
+/** Thrown only on a true transport failure (xhr.onerror — connection dropped, DNS blip,
+ * etc.), never on a completed HTTP response. That distinction is what makes retrying safe:
+ * an actual server response (even a 4xx/5xx) means the request was processed, so retrying
+ * it could re-upload — a transport failure means it never got there. */
+class UploadNetworkError extends Error {}
+
+function uploadFilesOnce(folder: string, files: File[], onProgress?: UploadProgressFn): Promise<Response> {
   return new Promise((resolve, reject) => {
     const form = new FormData()
     form.append('folderName', folder)
@@ -308,7 +327,28 @@ export const uploadFiles = (folder: string, files: File[], onProgress?: UploadPr
     }
 
     xhr.onload = () => resolve(new Response(xhr.responseText, { status: xhr.status }))
-    xhr.onerror = () => reject(new Error('Upload failed'))
+    xhr.onerror = () => reject(new UploadNetworkError('Upload failed — network error'))
     xhr.send(form)
   })
+}
+
+const UPLOAD_RETRY_ATTEMPTS = 3
+
+/** A brief network blip (1-2s of dropped connectivity mid-upload) shouldn't fail the whole
+ * request — retry a couple of times with backoff before giving up. Only fires for files
+ * small enough to still be on this single-shot path (see RESUMABLE_THRESHOLD in
+ * UploadZone.tsx); anything larger goes through the resumable session flow instead, which
+ * retries per-part rather than re-sending the whole file. */
+export async function uploadFiles(folder: string, files: File[], onProgress?: UploadProgressFn): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await uploadFilesOnce(folder, files, onProgress)
+    } catch (err) {
+      if (err instanceof UploadNetworkError && attempt < UPLOAD_RETRY_ATTEMPTS) {
+        await new Promise(r => setTimeout(r, attempt * 800))
+        continue
+      }
+      throw err
+    }
+  }
 }
