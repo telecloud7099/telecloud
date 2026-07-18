@@ -16,6 +16,7 @@ TeleCloud turns Telegram's unlimited Saved Messages storage into a proper file m
 
 - 📁 **Folders** — organize files into named folders (create / rename / delete)
 - ⬆️ **Upload** — drag & drop multiple files with per-file progress
+- 📦 **Large file upload** — files past Telegram's per-document cap are split into chunks, each uploaded as its own Saved Messages document and reassembled on download; uploads ≥10 MB use a durable, resumable session that survives a page refresh and retries only the failed part instead of the whole file
 - 🖼️ **Image gallery** — grid thumbnails with keyboard navigation and full-res click-through
 - 🎬 **Streaming previews** — video & audio play with **seeking** (HTTP Range / 206 Partial Content)
 - 📄 **PDF preview** — inline iframe viewer on desktop, open-in-tab on mobile
@@ -194,6 +195,9 @@ cd frontend && npm run dev    # → http://localhost:5173
 | `ENCRYPTION_KEY` | ✅ | Fernet key for encrypting Telegram credentials at rest |
 | `ALLOWED_ORIGINS` | | Comma-separated CORS origins (default: `http://localhost:5173,http://localhost:5001`) |
 | `MAX_SCAN_MESSAGES` | | Max Saved Messages to scan on first sync (default: `2000`, `0` = unlimited) |
+| `MAX_UPLOAD_SIZE_MB` | | Cap for single-shot `/upload` before a file must go through chunked sessions (default: `500`) |
+| `RESUMABLE_UPLOAD_THRESHOLD_MB` | | File size at/above which uploads use the durable, resumable session flow (default: `10`) |
+| `UPLOAD_SESSION_EXPIRE_SECONDS` | | How long an abandoned upload session is kept before being reaped (default: `604800`, 7 days) |
 
 ---
 
@@ -223,9 +227,19 @@ Media endpoints (`/file/`, `/thumbnail/`) also accept `?token=<jwt>` for browser
 | `POST` | `/files/sync` | Incremental sync of new Telegram messages |
 | `GET` | `/file/{msg_id}` | Stream file — supports HTTP `Range` for video seeking |
 | `GET` | `/thumbnail/{msg_id}` | Disk-cached thumbnail (JPEG) |
-| `POST` | `/upload` | Multipart upload → sends to Telegram Saved Messages |
+| `POST` | `/upload` | Multipart upload → sends to Telegram Saved Messages (single-shot, for files under the resumable threshold) |
 | `POST` | `/files/move` | Move files to a folder |
 | `DELETE` | `/files` | Delete files (from Telegram + DB) |
+
+### Chunked / resumable uploads
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/uploads` | Create an upload session for a large file (`{chunked: false}` if under the resumable threshold — use `/upload` instead) |
+| `GET` | `/uploads` | List this user's still-uploading sessions — used to reattach the progress widget after a page refresh |
+| `GET` | `/uploads/{session_id}` | Session status + live server→Telegram progress for the part in flight |
+| `PUT` | `/uploads/{session_id}/parts/{part_number}` | Upload one part |
+| `POST` | `/uploads/{session_id}/complete` | Finalize once all parts are confirmed → creates the `files` row |
+| `DELETE` | `/uploads/{session_id}` | Abort a session and clean up any Telegram parts already sent |
 
 ### Folders
 | Method | Path | Description |
@@ -248,6 +262,8 @@ Media endpoints (`/file/`, `/thumbnail/`) also accept `?token=<jwt>` for browser
 | `user_sessions` | Encrypted Telethon StringSession per user |
 | `folders` | Named folders per user |
 | `files` | File index synced from Telegram (name, size, mime, category, folder) |
+| `upload_sessions` | In-progress/completed large-file uploads (filename, total size, chunk size, status) |
+| `file_chunks` | Confirmed parts of a chunked upload, each its own Telegram document |
 | `sync_state` | Last sync timestamp + newest message id per user |
 | `user_settings` | Per-user preferences (theme, scan limit, etc.) |
 
@@ -267,7 +283,7 @@ Media endpoints (`/file/`, `/thumbnail/`) also accept `?token=<jwt>` for browser
 
 ## ⚠️ Limitations
 
-- Files larger than **2 GB** can't be uploaded (Telegram limit)
+- Single-shot uploads (`/upload`) are capped at `MAX_UPLOAD_SIZE_MB` (default 500 MB); larger files automatically use the chunked/resumable session flow instead, split into ≤1.9 GB (free) / ≤3.9 GB (Premium) Telegram documents per part
 - Initial scan covers the `MAX_SCAN_MESSAGES` most-recent Saved Messages (raise or set `0` for unlimited)
 - One Telegram account per server instance
 - Deleting a file in TeleCloud permanently deletes the Saved Message from Telegram
