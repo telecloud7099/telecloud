@@ -266,9 +266,30 @@ export function watchUploadSession(
           speedBps: p.speed_bps || undefined,
           etaSeconds: p.eta_seconds ?? undefined,
         })
+      } else if (status.next_part_number > status.total_chunks) {
+        // Every part is already confirmed on Telegram, but nothing ever finalized this
+        // session — the tab that would have called /complete right after the last part
+        // landed was closed or refreshed first. This passive watcher is the only thing
+        // left that will ever notice, so it finalizes instead of polling "100%" forever.
+        // Safe to call even if another tab finalizes at the same time — the backend
+        // treats /complete as idempotent once a session is already completed.
+        onUpdate({
+          sessionStatus: status.session_status,
+          phase: 'paused',
+          partNumber: status.next_part_number,
+          totalParts: status.total_chunks,
+          pct: 100,
+        })
+        try {
+          const completed = await safeJson(await completeUploadSession(sessionId), 'Finishing upload')
+          if (completed.status === 'success') { onEnded('completed'); return }
+        } catch {
+          // Couldn't finalize this poll (network blip, transient 5xx) — fall through and
+          // retry on the next tick rather than getting stuck on a single failed attempt.
+        }
       } else {
-        // No live part in flight — the backend is idle, waiting for this tab (or another)
-        // to send the next part. Nothing to watch but bytes-so-far.
+        // No live part in flight and parts remain — the backend is idle, waiting for this
+        // tab (or another) to send the next part. Nothing to watch but bytes-so-far.
         onUpdate({
           sessionStatus: status.session_status,
           phase: 'paused',
