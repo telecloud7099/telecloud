@@ -1,0 +1,73 @@
+name: telecloud
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+    container_name: telecloud-nginx
+    restart: unless-stopped
+    logging: *default-logging
+    ports:
+      - "80:80"
+    networks:
+      - edge
+    depends_on:
+      telecloud-app:
+        condition: service_healthy
+
+  telecloud-app:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    container_name: telecloud-app
+    restart: unless-stopped
+    init: true
+    logging: *default-logging
+    stop_grace_period: 30s
+    env_file:
+      - .env
+    networks:
+      - edge
+      - data
+    volumes:
+      - ${TELECLOUD_DATA_DIR:-/opt/telecloud/data}/uploads:/app/uploads
+      - ${TELECLOUD_DATA_DIR:-/opt/telecloud/data}/thumbs:/app/thumbs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # Defined now so the compose architecture doesn't change shape later, but unused
+  # until Phase 5B: telecloud-app's DATABASE_URL still points at Neon (see .env),
+  # so this container starts and stays healthy but idle until the cutover.
+  postgres:
+    image: postgres:16-alpine
+    container_name: telecloud-postgres
+    restart: unless-stopped
+    logging: *default-logging
+    env_file:
+      - .env
+    networks:
+      - data
+    volumes:
+      - ${TELECLOUD_DATA_DIR:-/opt/telecloud/data}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  edge:
+    driver: bridge
+  data:
+    driver: bridge

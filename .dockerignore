@@ -1,0 +1,40 @@
+# Secrets — never sent to the build context
+.env
+
+# Telegram sessions and legacy SQLite (dead code path, see project notes)
+sessions/
+*.session
+telecloud.db
+*.db
+
+# Runtime data — populated at runtime via bind mounts, not baked into the image
+thumbs/
+uploads/
+
+# Stale/regenerated build output — frontend-builder stage produces its own fresh dist/,
+# no reason to ship a possibly-stale local one into the build context
+static/app/
+frontend/dist/
+frontend/node_modules/
+
+# Python
+__pycache__/
+*.pyc
+venv/
+venv_mac/
+myenv/
+
+# Node
+node_modules/
+
+# Logs
+*.log
+app.log.*
+
+# VCS / tooling / editor
+.git/
+.claude/
+.zencoder/
+.zenflow/
+.DS_Store
+Thumbs.db
