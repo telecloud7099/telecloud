@@ -96,6 +96,7 @@ telecloud/
 ├── thumbs/                   # Thumbnail disk cache (gitignored)
 ├── uploads/                  # Temp upload staging area (gitignored)
 ├── start.sh                  # One-command run: build frontend if stale + start server
+├── deploy.sh                 # VM/home-server deploy workflow: pull, build, health-check, auto-rollback
 ├── requirements.txt
 ├── .env.app.example          # Template for bare-metal dev / app-container secrets
 ├── .env.db.example           # Template for Docker postgres-container secrets
