@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # deploy.sh — Phase 8 deployment workflow (SECURITY_ARCHITECTURE.md §7 process).
 #
+# Run this directly — do NOT `git pull` by hand first. The whole point of this
+# script is that it does the pull itself and can compare before/after; pulling
+# manually beforehand just makes every run look like "nothing to deploy".
+#
 # Manually invoked on the VM/home-server host. Deliberately NOT triggered by a git
 # push or webhook — unattended auto-deploy would remove the human review step this
 # project has relied on every phase (reviewing every diff before commit/push). That
