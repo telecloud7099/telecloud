@@ -159,6 +159,16 @@ non-trivial migration described above rather than a reflexive fix. Lesson carrie
 forward: never assume a command's output is safe to paste back into a chat just
 because it's "only going to the local terminal" — the transcript is a channel too.
 
+**Second occurrence, Phase 9 (2026-07-22):** a real, live JWT was pasted directly into
+the chat transcript while testing the Phase 9 Range-request script. Traced
+`verify_jwt`/`logout` (`backend/auth.py:28-30`, `backend/routes/auth.py:270-275`) and
+confirmed JWTs are validated statelessly with no revocation list — logging out does
+**not** invalidate a leaked token; it remains valid for its full ~30-day lifetime.
+`JWT_SECRET` was rotated immediately per the runbook above. Going forward: when a
+token/secret needs to be used in a test command, set it as a local shell variable on
+the target machine and never paste the value itself back into the conversation — only
+pass/fail output should cross that channel.
+
 ---
 
 ## Notes
