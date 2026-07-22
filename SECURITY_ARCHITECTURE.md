@@ -336,7 +336,7 @@ Reviewed whenever their target phase/trigger comes up, not left indefinitely.
 
 | Item | Domain (§5 #) | Severity | Why deferred | Target phase / trigger |
 |---|---|---|---|---|
-| CSP header for the SPA | 2 (reverse proxy hardening) | Low | Needs deliberate tuning against actual script/style/media sources — a rushed default risks silently breaking the SPA | Phase 7, alongside rate limiting |
+| Switch CSP from Report-Only to enforcing | 2 (reverse proxy hardening) | Low | Report-Only validated 2026-07-22 with zero unexpected violations across the full functional matrix (login/list/upload/download/resumable upload) — deliberately held back one cycle per explicit instruction before enforcing | Immediate next follow-up, not open-ended — small, isolated change (drop `-Report-Only` from the header name) |
 | Malware scanning on uploads | 13 (upload validation) | Low | Poor fit for a single-operator threat model; real cost (ClamAV sidecar) for low payoff today | Revisit only if link-sharing with other people is ever added |
 | Disk-level encryption for Postgres data directory | 11 (PostgreSQL hardening) | N/A today | Dormant while Neon hosts the DB | Only if Phase 5 (Neon → local Postgres) is ever un-deferred |
 | HSTS header | 3 (TLS) | N/A today | No TLS listener active yet on the VM | Enable alongside Phase 7's TLS/Cloudflare Tunnel work |
