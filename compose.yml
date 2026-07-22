@@ -32,7 +32,7 @@ services:
     logging: *default-logging
     stop_grace_period: 30s
     env_file:
-      - .env
+      - .env.app
     networks:
       - edge
       - data
@@ -47,7 +47,7 @@ services:
       start_period: 20s
 
   # Defined now so the compose architecture doesn't change shape later, but unused
-  # until Phase 5B: telecloud-app's DATABASE_URL still points at Neon (see .env),
+  # until Phase 5B: telecloud-app's DATABASE_URL still points at Neon (see .env.app),
   # so this container starts and stays healthy but idle until the cutover.
   postgres:
     image: postgres:16-alpine
@@ -55,13 +55,17 @@ services:
     restart: unless-stopped
     logging: *default-logging
     env_file:
-      - .env
+      - .env.db
     networks:
       - data
     volumes:
       - ${TELECLOUD_DATA_DIR:-/opt/telecloud/data}/postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      # $$ (escaped from Compose's own substitution) so POSTGRES_USER is read from the
+      # container's own runtime env (via .env.db above) at healthcheck-execution time,
+      # instead of needing to also exist in the project-root .env used for compose-file
+      # substitution (see .env.example) — keeps the secret in exactly one file.
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\""]
       interval: 10s
       timeout: 5s
       retries: 5

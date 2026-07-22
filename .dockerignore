@@ -1,5 +1,7 @@
 # Secrets — never sent to the build context
 .env
+.env.app
+.env.db
 
 # Telegram sessions and legacy SQLite (dead code path, see project notes)
 sessions/

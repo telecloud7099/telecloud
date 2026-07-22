@@ -97,7 +97,9 @@ telecloud/
 ├── uploads/                  # Temp upload staging area (gitignored)
 ├── start.sh                  # One-command run: build frontend if stale + start server
 ├── requirements.txt
-└── .env.example              # Template for all required environment variables
+├── .env.app.example          # Template for bare-metal dev / app-container secrets
+├── .env.db.example           # Template for Docker postgres-container secrets
+└── .env.example              # Template for Compose's own variable substitution (non-secret)
 ```
 
 ---
@@ -128,8 +130,11 @@ cd frontend && npm install && cd ..
 ### 2. Configure
 
 ```bash
-cp .env.example .env
+cp .env.app.example .env
 ```
+
+(`.env.app.example` has everything bare-metal dev needs. `.env.db.example` and `.env.example`
+are Docker/Compose-only — see `SECURITY_NOTES.md`'s Environment File Architecture section.)
 
 Fill in `.env`:
 
