@@ -1,11 +1,15 @@
 # Security Notes — TeleCloud
 
-> Issues to revisit before any public/hosted deployment.
+> Issues to revisit before any public/hosted deployment. This file tracks specific
+> known application-level bugs. For the governing long-term security architecture —
+> threat model, severity classification, design principles, and the mandatory
+> Internet Exposure Checklist these issues feed into — see `SECURITY_ARCHITECTURE.md`.
 
 ---
 
 ## 1. Stored XSS via innerHTML — `upload.html:281, 326, 359`
-**Priority: Fix before going public**
+**Severity: High** (see `SECURITY_ARCHITECTURE.md` §2) — blocks the Internet Exposure
+Checklist until fixed.
 
 File names from Telegram and folder names are injected directly into `innerHTML` without escaping. A crafted filename like `<img src=x onerror=alert(1)>` would execute JS in the browser.
 
@@ -19,7 +23,7 @@ File names from Telegram and folder names are injected directly into `innerHTML`
 ---
 
 ## 2. Content-Disposition Filename Not Sanitized — `main.py:1146`
-**Priority: Low (Werkzeug blocks the main attack)**
+**Severity: Low** (Werkzeug blocks the main attack)
 
 `message.file.name` from Telegram is embedded raw into the `Content-Disposition` header. CRLF injection is blocked by Werkzeug automatically, but the filename is still unescaped.
 
@@ -28,7 +32,9 @@ File names from Telegram and folder names are injected directly into `innerHTML`
 ---
 
 ## 3. Plaintext Fallback for Encrypted Credentials — `main.py:63-68`
-**Priority: Low (requires filesystem access to exploit)**
+**Severity: Medium** (requires filesystem access to exploit, but silently degrades an
+encryption-at-rest control without alerting anyone — see `SECURITY_ARCHITECTURE.md`
+§2 and the "fail securely" principle in §3)
 
 If Fernet decryption of `api_sessions.json` or `user_folders.json` fails, the code silently falls back to reading the file as plaintext JSON.
 
@@ -37,7 +43,7 @@ If Fernet decryption of `api_sessions.json` or `user_folders.json` fails, the co
 ---
 
 ## 4. `phone_code_hashes` Not Scoped to Session — `main.py:141`
-**Priority: Low (OTP still required to exploit)**
+**Severity: Low** (OTP still required to exploit)
 
 The OTP hash is stored in a global dict keyed only by phone number, not tied to any session or IP. An attacker who obtains the OTP from another source could complete login from any session.
 
@@ -123,6 +129,9 @@ because it's "only going to the local terminal" — the transcript is a channel 
 ---
 
 ## Notes
-- Issues 2, 3, 4 are low risk for local/personal use.
-- Issue 1 (XSS) is the only one that matters if the app is ever hosted publicly.
-- All four should be addressed before any public deployment.
+- Severities reclassified 2026-07-22 against `SECURITY_ARCHITECTURE.md` §2: issue #1 is
+  **High**, issue #3 is **Medium**, issues #2 and #4 are **Low**.
+- Per `SECURITY_ARCHITECTURE.md` §4 (Internet Exposure Checklist), issue #1 is a hard
+  gate — TeleCloud may not be made reachable from the public internet until it's fixed.
+- Issues #2–#4 don't block internet exposure but should still be addressed per the
+  severity guidance in `SECURITY_ARCHITECTURE.md` §2.
