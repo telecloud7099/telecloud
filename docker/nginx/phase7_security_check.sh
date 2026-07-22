@@ -57,22 +57,34 @@ check "auth zone throttles rapid /send_code requests" "yes" "$got429"
 
 echo
 echo "== Malformed request handling =="
+# Written to a temp file rather than passed as a command-line argument — a 2MB shell
+# argument exceeds the OS's ARG_MAX and makes curl itself fail before sending anything
+# (seen in the first run: "Argument list too long"), which is a test-tooling bug, not
+# a finding about nginx.
+oversized_file="$(mktemp)"
+head -c 2000000 /dev/zero | tr '\0' 'a' > "$oversized_file"
 oversized=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/send_code" \
   -H "Content-Type: application/json" \
-  --data-binary "$(head -c 2000000 /dev/zero | tr '\0' 'a')")
+  --data-binary "@${oversized_file}")
+rm -f "$oversized_file"
 check "oversized body rejected (413, global client_max_body_size)" "413" "$oversized"
 
 badmethod=$(curl -s -o /dev/null -w "%{http_code}" -X TRACE "$BASE/")
 check "unsupported HTTP method rejected (405)" "405" "$badmethod"
 
-# Path-traversal probe is informational, not a strict assertion: nginx's own URI
-# normalization already rewrites literal ../ sequences before location matching, and
-# /file/{file_id} looks the id up as a DB/Telegram reference rather than a raw
-# filesystem path — so the expected safe outcome could legitimately show up as a 404
-# from nginx, a 404 from the app, or the SPA fallback (200), depending on where the
-# request lands. Record what actually happens rather than asserting one exact code.
-traversal_code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/file/../../../../etc/passwd")
-info "path-traversal probe on /file/ returned $traversal_code (expected: NOT actual file contents; review manually if this looks unexpected)"
+# --path-as-is is required here: curl normalizes ../ sequences out of the URL itself
+# by default, so without this flag the request that actually reaches nginx is just
+# "/etc/passwd" (whatever curl decided to collapse the path to), not the raw
+# traversal string an actual attacker's HTTP client would send. This is testing what
+# nginx/the app do with a literal, un-normalized traversal attempt.
+traversal_body="$(curl -s --path-as-is "$BASE/file/../../../../etc/passwd")"
+traversal_code=$(curl -s --path-as-is -o /dev/null -w "%{http_code}" "$BASE/file/../../../../etc/passwd")
+if echo "$traversal_body" | grep -q "root:.*:0:0:"; then
+  echo "FAIL: path-traversal on /file/ returned actual /etc/passwd contents (HTTP $traversal_code)"
+  FAIL=$((FAIL + 1))
+else
+  info "path-traversal probe on /file/ returned HTTP $traversal_code, body does NOT contain /etc/passwd contents (first 80 chars: $(echo "$traversal_body" | head -c 80 | tr -d '\n'))"
+fi
 
 echo
 echo "== Summary: $PASS passed, $FAIL failed, $INFO informational =="
