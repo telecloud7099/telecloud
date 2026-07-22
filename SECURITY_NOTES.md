@@ -51,7 +51,40 @@ The OTP hash is stored in a global dict keyed only by phone number, not tied to 
 
 ---
 
-## 5. Environment File Architecture (Phase 6, 2026-07-22)
+## 5. JWT Exposed in nginx Access Logs via Query-String Media Auth — `docker/nginx/nginx.conf` (`log_format main`), `backend/auth.py:46-61`
+**Severity: Medium** (see `SECURITY_ARCHITECTURE.md` §2 — requires read access to the
+nginx access log to exploit, but the resulting impact — a live, 30-day bearer token —
+is more severe than a typical "requires filesystem access" finding)
+
+`get_media_user` in `backend/auth.py` accepts the JWT via a `?token=` query parameter
+as well as the `Authorization` header, since `<video>`/`<img>`/`<audio>` `src`
+attributes can't send custom headers — a deliberate and necessary design choice, not a
+bug on its own. However, `nginx.conf`'s `log_format main` logs `$request`, which
+includes the full request line and therefore the full query string. Every media
+request (thumbnail, file stream, video seek) writes the JWT in plaintext to
+`/var/log/nginx/access.log`. A JWT is valid for 30 days (`JWT_EXPIRE_DAYS` in
+`auth.py`), so anyone who obtains read access to that log file — e.g. via a separate
+vulnerability, an insecure log-shipping/backup configuration, or local host access —
+gets a live, fully-privileged bearer token for up to a month, not just metadata.
+
+**Found:** 2026-07-22, while scoping Phase 9's Range-request functional test (tracing
+the auth path for `/file/{file_id}`).
+
+**Fix (not yet implemented — tracked here per `SECURITY_ARCHITECTURE.md` §7,
+deliberately not fixed in Phase 9 to avoid scope creep):** options to evaluate
+together rather than pick reflexively:
+- Redact the `token` query parameter in nginx's log format for the `/file/` and
+  `/thumbnail/` locations specifically (a custom log format for just those two
+  locations, or a `map` on `$request` that strips the token before logging).
+- Move media auth off the long-lived session JWT entirely, toward a short-lived,
+  single-purpose signed URL/token minted just for that media request — more work, but
+  removes the underlying exposure rather than just hiding it from logs.
+- At minimum, treat `access.log` itself as sensitive (permissions, retention, access
+  control) until one of the above lands.
+
+---
+
+## 6. Environment File Architecture (Phase 6, 2026-07-22)
 
 Secrets are split by consumer so that compromising one container, or reading one file,
 doesn't expose secrets that container has no reason to hold.
@@ -130,8 +163,11 @@ because it's "only going to the local terminal" — the transcript is a channel 
 
 ## Notes
 - Severities reclassified 2026-07-22 against `SECURITY_ARCHITECTURE.md` §2: issue #1 is
-  **High**, issue #3 is **Medium**, issues #2 and #4 are **Low**.
+  **High**, issues #3 and #5 are **Medium**, issues #2 and #4 are **Low**.
 - Per `SECURITY_ARCHITECTURE.md` §4 (Internet Exposure Checklist), issue #1 is a hard
   gate — TeleCloud may not be made reachable from the public internet until it's fixed.
-- Issues #2–#4 don't block internet exposure but should still be addressed per the
+  Issue #5 (JWT in access logs) is not currently a hard gate but should be resolved or
+  explicitly re-evaluated before the home server's logs are shipped/backed up anywhere
+  off-box.
+- Issues #2–#5 don't block internet exposure but should still be addressed per the
   severity guidance in `SECURITY_ARCHITECTURE.md` §2.

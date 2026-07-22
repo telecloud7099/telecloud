@@ -76,6 +76,7 @@ label determines urgency, not the order findings happen to be discovered in.
 | #2 Content-Disposition filename | "Low" | **Low** | CRLF injection already blocked by the framework; residual risk is cosmetic. |
 | #3 Plaintext fallback for encrypted credentials | "Low" | **Medium** | Requires filesystem access to exploit today, but silently degrades a real security control (encryption at rest) without alerting anyone — the silence is what pushes this above a pure Low. |
 | #4 `phone_code_hash` not scoped to session | "Low" | **Low** | Still requires the OTP itself from another source to exploit. |
+| #5 JWT exposed in nginx access logs via `?token=` media auth | *(found 2026-07-22)* | **Medium** | Requires read access to the access log to exploit, but a successful read yields a live, fully-privileged 30-day bearer token — a more severe payoff than a typical "requires filesystem access" finding, which is why it's Medium rather than Low. |
 
 ---
 
