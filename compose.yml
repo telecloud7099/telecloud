@@ -62,8 +62,14 @@ services:
       - .env.db
     networks:
       - data
+    # Mounted at /var/lib/postgresql (not .../data) -- a breaking change in the official
+    # image starting at v18: it now expects the volume one level up and creates its own
+    # version-specific subdirectory inside, to support `pg_upgrade --link` cleanly without
+    # mount-point boundary issues (docker-library/postgres PR #1259 / issue #37). Confirmed
+    # by direct failure on this VM (Phase 13, 2026-07-23) -- the old .../data mount point
+    # made the v18 entrypoint refuse to start, citing exactly this change.
     volumes:
-      - ${TELECLOUD_DATA_DIR:-/opt/telecloud/data}/postgres:/var/lib/postgresql/data
+      - ${TELECLOUD_DATA_DIR:-/opt/telecloud/data}/postgres:/var/lib/postgresql
     healthcheck:
       # $$ (escaped from Compose's own substitution) so POSTGRES_USER is read from the
       # container's own runtime env (via .env.db above) at healthcheck-execution time,
