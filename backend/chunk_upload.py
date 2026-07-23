@@ -10,11 +10,19 @@ part is simply unconfirmed and the client re-sends it from byte 0 (a retried PUT
 the temp file in truncate mode). There is no separate crash-recovery state machine.
 
 Chunk-grouping metadata for scan-based recovery (see routes/files.py's _full_scan) is
-carried in the message CAPTION, not the filename. Telegram silently rewrites document
-filenames that look like a "double extension" (e.g. a `.bin.` middle segment gets every
-dot/hyphen replaced with `_`, verified empirically) — captions are plain message text and
-are never touched, so they're the only reliable channel for metadata that must survive a
-Postgres wipe and be re-derived from Telegram alone.
+carried in the message CAPTION, not the filename — the on-Telegram filename for a chunk
+part stays the internal `{session_id}_{part_number}.tmp` disk name and is never meant to
+be user-facing (see filename_mangling_test.py, run 2026-07-23 against Telethon 1.32.1 /
+MTProto layer 166: 5 filenames including double-extension patterns like `video.part1.mp4`
+and `report.v2.final.pdf` all survived send_file() -> get_messages() unchanged, so there's
+no current evidence of Telegram rewriting document filenames). An earlier version of this
+docstring claimed such rewriting was "verified empirically" without recording what was
+actually tested — treat that as an unverified historical observation, not a current fact.
+Captions are used regardless, because they're the only channel that reliably survives a
+Postgres wipe and lets _full_scan re-derive grouping/order/original-filename from Telegram
+alone — a property the document filename would share only if a future change also started
+threading the real filename through DocumentAttributeFilename for chunk parts, which is a
+deliberate choice not to do (see routes/files.py's single-shot-only use of it).
 """
 import asyncio
 import logging
