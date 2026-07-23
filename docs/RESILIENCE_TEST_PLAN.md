@@ -301,6 +301,42 @@ scenario, not just a testing artifact. Worth a dedicated instrumented investigat
 Phase 15's go/no-go, and worth remembering to close out stale sessions/tabs before future
 resilience runs so they don't confound results the way this one did.
 
+### Active large upload correlated with the whole app becoming unresponsive (2026-07-23)
+
+**Observed, not a confirmed root cause.** While a 500MB re-upload (session `5b859150-...`)
+was running in the background, `telecloud-app`'s Docker healthcheck (`curl -f
+http://localhost:8000/health`, 5s timeout) failed 12 consecutive times, each attempt
+transferring **zero bytes for the entire 5-second window** (`docker inspect telecloud-app
+--format '{{json .State.Health}}'` showed `"ExitCode": -1` and `Dload...0 0 0 0 0 0`
+throughout every logged attempt) — not slow, completely unresponsive. `docker compose ps`
+showed the container `unhealthy`, and a plain external `curl` DELETE request to the same API
+hung indefinitely with no response at all, matching the healthcheck's own symptom.
+`docker compose restart telecloud-app` then took the full 30-second `stop_grace_period`
+before the container came back — a responsive process normally exits within a second or two
+of SIGTERM, so needing the entire grace period is itself consistent with the event loop
+having been unable to process the shutdown signal promptly. Once restarted, the container
+returned to `healthy` within 35 seconds and stayed healthy after the upload session was
+aborted.
+
+**What we can say:** the stall was temporally correlated with the active background upload
+(cryptg encryption + disk I/O for a 500MB transfer) and cleared immediately when that upload
+was interrupted by the restart. **What we cannot yet say:** the exact blocking call. This
+app runs a single Uvicorn worker with one event loop (a locked architectural decision, see
+[[project_vbox_deployment_plan]]) — any synchronous call that doesn't yield control (a large
+`os.fsync()`, blocking file reads inside Telethon's upload path, or `cryptg.encrypt_ige()`
+itself, which Phase 10's benchmark already showed does not appear to release the GIL) could
+produce exactly this symptom. No profiling or instrumentation was added to pinpoint which
+one; this needs the same kind of targeted investigation as the stale-client-activity finding
+above before Phase 15.
+
+**Why this matters:** if confirmed, this means a single active large upload can make the
+entire app briefly unresponsive to *every* user, repeatedly, for as long as the upload runs
+— not just slow for the uploading user. That's a materially different (and more serious)
+finding than anything else in this phase, since it's not specific to restart/crash recovery
+at all — it could happen during completely normal operation with no fault injected. Flagged
+here rather than in the main scenario results because it wasn't something Scenario 1 set out
+to test; it surfaced as a side effect of the confounded run above.
+
 ---
 
 ## Sign-off log
