@@ -23,6 +23,12 @@ _clients: dict[int, TelegramClient] = {}
 _connect_locks: dict[int, asyncio.Lock] = {}
 # Timestamp of last connection failure — drives 30-second backoff
 _connect_failed_at: dict[int, float] = {}
+# Number of callers currently inside get_client() for a given user — diagnostic only,
+# added to investigate a 2026-07-23 incident where reconnect attempts kept timing out
+# for 15+ minutes after a backend restart despite Telegram itself being reachable in
+# under a second when tested in isolation (see docs/RESILIENCE_TEST_PLAN.md). Lets log
+# lines show whether a slow attempt was contending with concurrent callers.
+_active_calls: dict[int, int] = {}
 
 CONNECT_BACKOFF = 30  # seconds to wait after a connection failure before retrying
 
@@ -45,25 +51,14 @@ async def get_client(
     string_session: str = "",
     require_authorized: bool = False,
 ) -> TelegramClient:
-    # Fast path: return connected client without acquiring the lock
-    if telegram_user_id in _clients:
-        client = _clients[telegram_user_id]
-        if client.is_connected():
-            if require_authorized and not await client.is_user_authorized():
-                await _drop(telegram_user_id)
-            else:
-                _connect_failed_at.pop(telegram_user_id, None)
-                return client
+    t_enter = _time.monotonic()
+    _active_calls[telegram_user_id] = _active_calls.get(telegram_user_id, 0) + 1
+    concurrent_count = _active_calls[telegram_user_id]
+    if concurrent_count > 1:
+        logger.info(f"get_client user={telegram_user_id}: entering with {concurrent_count} concurrent callers")
 
-    # Backoff: if we recently failed, reject immediately (don't hold the lock for 12 seconds)
-    last_failure = _connect_failed_at.get(telegram_user_id, 0)
-    if _time.time() - last_failure < CONNECT_BACKOFF:
-        secs = int(CONNECT_BACKOFF - (_time.time() - last_failure))
-        raise Exception(f"Telegram connection unavailable, retrying in {secs}s")
-
-    # Slow path: create / reconnect under a per-user lock to avoid concurrent connections
-    async with _get_lock(telegram_user_id):
-        # Re-check inside the lock in case another coroutine already created it
+    try:
+        # Fast path: return connected client without acquiring the lock
         if telegram_user_id in _clients:
             client = _clients[telegram_user_id]
             if client.is_connected():
@@ -72,48 +67,107 @@ async def get_client(
                 else:
                     _connect_failed_at.pop(telegram_user_id, None)
                     return client
-            else:
-                try:
-                    await asyncio.wait_for(client.connect(), timeout=12)
+
+        # Backoff: if we recently failed, reject immediately (don't hold the lock for 12 seconds)
+        last_failure = _connect_failed_at.get(telegram_user_id, 0)
+        if _time.time() - last_failure < CONNECT_BACKOFF:
+            secs = int(CONNECT_BACKOFF - (_time.time() - last_failure))
+            logger.info(
+                f"get_client user={telegram_user_id}: rejected by backoff, {secs}s remaining "
+                f"(concurrent_callers={concurrent_count})"
+            )
+            raise Exception(f"Telegram connection unavailable, retrying in {secs}s")
+
+        # Slow path: create / reconnect under a per-user lock to avoid concurrent connections
+        t_before_lock = _time.monotonic()
+        async with _get_lock(telegram_user_id):
+            t_lock_acquired = _time.monotonic()
+            lock_wait = t_lock_acquired - t_before_lock
+            if lock_wait > 0.05:
+                logger.info(
+                    f"get_client user={telegram_user_id}: waited {lock_wait:.2f}s for lock "
+                    f"(concurrent_callers={concurrent_count})"
+                )
+
+            # Re-check inside the lock in case another coroutine already created it
+            if telegram_user_id in _clients:
+                client = _clients[telegram_user_id]
+                if client.is_connected():
                     if require_authorized and not await client.is_user_authorized():
                         await _drop(telegram_user_id)
                     else:
                         _connect_failed_at.pop(telegram_user_id, None)
                         return client
+                else:
+                    t_connect_start = _time.monotonic()
+                    try:
+                        await asyncio.wait_for(client.connect(), timeout=12)
+                        connect_elapsed = _time.monotonic() - t_connect_start
+                        logger.info(
+                            f"get_client user={telegram_user_id}: reconnect of existing client "
+                            f"succeeded in {connect_elapsed:.2f}s (lock_wait={lock_wait:.2f}s, "
+                            f"total={_time.monotonic() - t_enter:.2f}s)"
+                        )
+                        if require_authorized and not await client.is_user_authorized():
+                            await _drop(telegram_user_id)
+                        else:
+                            _connect_failed_at.pop(telegram_user_id, None)
+                            return client
+                    except Exception as e:
+                        connect_elapsed = _time.monotonic() - t_connect_start
+                        logger.warning(
+                            f"get_client user={telegram_user_id}: reconnect of existing client "
+                            f"FAILED after {connect_elapsed:.2f}s ({e}) (lock_wait={lock_wait:.2f}s, "
+                            f"total={_time.monotonic() - t_enter:.2f}s)"
+                        )
+                        await _drop(telegram_user_id)
+
+            session = StringSession(string_session) if string_session else StringSession()
+            # connection_retries=1: one attempt — avoids 37-second OS TCP timeout loops
+            client = TelegramClient(session, api_id, api_hash, connection_retries=1)
+            t_connect_start = _time.monotonic()
+            try:
+                await asyncio.wait_for(client.connect(), timeout=12)
+                connect_elapsed = _time.monotonic() - t_connect_start
+                logger.info(
+                    f"get_client user={telegram_user_id}: new client connect succeeded in "
+                    f"{connect_elapsed:.2f}s (lock_wait={lock_wait:.2f}s, "
+                    f"total={_time.monotonic() - t_enter:.2f}s, concurrent_callers={concurrent_count})"
+                )
+            except AuthKeyDuplicatedError:
+                # Permanent: Telegram killed this auth key for concurrent use from two IPs.
+                # No backoff/retry — surface it so the caller wipes the stored session.
+                logger.error(f"Telegram revoked the session for user {telegram_user_id} (AuthKeyDuplicatedError)")
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=3)
                 except Exception:
-                    await _drop(telegram_user_id)
+                    pass
+                raise SessionRevokedError()
+            except (asyncio.TimeoutError, Exception) as e:
+                connect_elapsed = _time.monotonic() - t_connect_start
+                total_elapsed = _time.monotonic() - t_enter
+                _connect_failed_at[telegram_user_id] = _time.time()
+                logger.warning(
+                    f"Telegram connect failed for user {telegram_user_id}: {e} "
+                    f"(lock_wait={lock_wait:.2f}s, connect_attempt={connect_elapsed:.2f}s, "
+                    f"total={total_elapsed:.2f}s, concurrent_callers={concurrent_count})"
+                )
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=3)
+                except Exception:
+                    pass
+                raise Exception("Telegram connection timed out. Please try again.")
 
-        session = StringSession(string_session) if string_session else StringSession()
-        # connection_retries=1: one attempt — avoids 37-second OS TCP timeout loops
-        client = TelegramClient(session, api_id, api_hash, connection_retries=1)
-        try:
-            await asyncio.wait_for(client.connect(), timeout=12)
-        except AuthKeyDuplicatedError:
-            # Permanent: Telegram killed this auth key for concurrent use from two IPs.
-            # No backoff/retry — surface it so the caller wipes the stored session.
-            logger.error(f"Telegram revoked the session for user {telegram_user_id} (AuthKeyDuplicatedError)")
-            try:
-                await asyncio.wait_for(client.disconnect(), timeout=3)
-            except Exception:
-                pass
-            raise SessionRevokedError()
-        except (asyncio.TimeoutError, Exception) as e:
-            _connect_failed_at[telegram_user_id] = _time.time()
-            logger.warning(f"Telegram connect failed for user {telegram_user_id}: {e}")
-            try:
-                await asyncio.wait_for(client.disconnect(), timeout=3)
-            except Exception:
-                pass
-            raise Exception("Telegram connection timed out. Please try again.")
+            if require_authorized and not await client.is_user_authorized():
+                await client.disconnect()
+                _connect_failed_at[telegram_user_id] = _time.time()
+                raise Exception("Telegram session not authorized. Please login again.")
 
-        if require_authorized and not await client.is_user_authorized():
-            await client.disconnect()
-            _connect_failed_at[telegram_user_id] = _time.time()
-            raise Exception("Telegram session not authorized. Please login again.")
-
-        _connect_failed_at.pop(telegram_user_id, None)
-        _clients[telegram_user_id] = client
-        return client
+            _connect_failed_at.pop(telegram_user_id, None)
+            _clients[telegram_user_id] = client
+            return client
+    finally:
+        _active_calls[telegram_user_id] -= 1
 
 
 async def get_unauthenticated_client(phone: str, api_id: int, api_hash: str) -> TelegramClient:
