@@ -124,18 +124,64 @@ but not impossible if it lands mid-`send_file`) — check for it, not fatal if f
 **Procedure:** Same setup as Scenario 1, but `docker kill telecloud-app` instead of
 `restart` — no SIGTERM, no grace period, immediate SIGKILL.
 
-**Expected behavior:** strictly harsher than Scenario 1 — guarantees the background upload
-task is killed mid-transfer with zero chance to reach a clean boundary. Since this is an
-unexpected exit (not an operator `docker compose stop`), the `restart: unless-stopped`
-policy should bring the container back **automatically**, with no manual
-`docker compose up` needed.
+**Original expected behavior (revised after testing, see below):** this plan originally
+assumed `docker kill` was an "unexpected exit" that `restart: unless-stopped` would recover
+from automatically. **That assumption was wrong, and was corrected experimentally, not just
+asserted** (2026-07-23):
 
-**Success criteria:** everything from Scenario 1, plus explicit confirmation that the
-container restarted on its own (checked via `docker compose ps` / `docker events`) without
-any manual intervention.
+- `docker kill telecloud-app` against a live upload (40MB/500MB in) produced `Exited (137)`
+  (137 = 128+9, confirms SIGKILL delivered) — but the container **did not auto-restart**,
+  even 51+ seconds later (`docker compose ps -a` showed it sitting in `Exited` state; a plain
+  `docker compose ps` didn't even list it, since that command hides non-running containers by
+  default — don't mistake that for the container having vanished).
+- Confirmed the configured policy really is `unless-stopped`
+  (`docker inspect telecloud-app --format '{{.HostConfig.RestartPolicy.Name}}'`), ruling out
+  a config mistake.
+- **Root cause, verified via `man 7 pid_namespaces`, not just theorized:** Docker's restart
+  policy distinguishes *why* PID 1 exited. An explicit `docker kill`/`docker stop` operates
+  from *outside* the container's PID namespace (using the host-visible PID) and is treated as
+  a deliberate operator action — `unless-stopped` intentionally does not override it (so
+  `docker kill` isn't rendered pointless by an instant bounce-back). This is unrelated to
+  in-process behavior; it's about which "namespace" the kill command itself was issued from.
+- To get a genuine comparison, we tried killing PID 1 *from inside* the container instead
+  (`docker exec telecloud-app kill -9 1` → failed, `kill` binary isn't in this slim image;
+  then `docker exec ... python3 -c "os.kill(1, signal.SIGKILL)"` → ran with no error, but
+  the container's uptime never reset — nothing happened). `/proc/1/status` showed PID 1 is
+  `docker-init` (tini, from `init: true` in `compose.yml`). Per `pid_namespaces(7)`: a signal
+  with no established handler (SIGKILL always qualifies — it can never have a handler) sent
+  to a namespace's init process **by another process inside that same namespace** is
+  silently discarded by the kernel specifically to stop a namespace's init from being
+  trivially killed by anything running inside it. That's exactly why this attempt silently
+  no-op'd — a kernel protection, not a Docker or app behavior.
+- **The valid way to simulate a true internal crash:** kill the actual `uvicorn` child
+  process (not PID 1) from inside the container instead — found via `docker top telecloud-app`
+  (host-visible PIDs) then targeted via a small script walking `/proc` inside the container to
+  find and `os.kill()` the uvicorn PID directly (not PID 1, so the namespace protection above
+  doesn't apply). Result: **the container auto-restarted with no manual intervention** —
+  `docker compose ps` showed `Up 8 seconds (health: starting)` moments later, `healthy` again
+  within about a minute. This makes sense: tini's whole job is to exit when its watched child
+  exits, so tini itself calling `exit()` (a normal process exit, not an externally-delivered
+  kill) is exactly the "unexpected exit" case `unless-stopped` is designed to catch.
 
-**Failure criteria:** same as Scenario 1, plus: container does not auto-restart and requires
-manual `docker compose up -d`.
+**Corrected conclusion:** `restart: unless-stopped` behaves exactly as documented — it
+recovers from a genuine in-process crash (an OOM-kill, an unhandled exception that takes down
+the process, a segfault) automatically, but **does not** recover from an explicit
+`docker kill`/`docker stop` issued from the host, by design. Both were tested directly, not
+inferred from one result. **Operational implication for Phase 15:** if anyone (an operator, a
+monitoring tool, a future orchestrator) ever runs `docker kill`/`docker stop` against this
+container on the real home server, it will **not** come back on its own — that needs to be a
+known, documented fact in the eventual runbook, not a surprise discovered during an incident.
+
+**Success criteria (revised):** for the `docker kill` procedure specifically — confirm exit
+code 137 and confirm it does *not* auto-restart (that's now the expected, correct behavior,
+not a failure). Recovery-mechanics verification (session state, resume, checksum) should be
+done via the internal-crash method above, or by manually restarting after `docker kill`
+(`docker compose start telecloud-app`) and then following Scenario 1's verification steps.
+
+**Failure criteria (revised):** the container failing to come back even after a *manual*
+`docker compose start` following `docker kill`; or the internal-crash method failing to
+trigger auto-restart (which would contradict the verified mechanism above and warrant
+re-investigation).
 
 **Risk:** highest-probability scenario for the orphaned-Telegram-message case — explicitly
 check for it in Scenario 8's integrity pass.
@@ -345,3 +391,4 @@ to test; it surfaced as a side effect of the confounded run above.
 |---|---|---|---|
 | 2026-07-23 | 1 (restart mid-upload) | PASS (with caveat) | First run: recovery mechanics correct (session stayed `uploading`, `part_progress` cleared, `next_part_number` unchanged, resumable via re-PUT) but recovery was prolonged 15+ min by the stale-client-activity finding above, unrelated to the restart/recovery logic itself. |
 | 2026-07-23 | 1 + 4 (clean redo: restart mid-upload, then resume/complete) | **PASS** | Clean run, no stale tab, fresh session `d6f4a62f-49d9-4a22-93bd-a973b130dc0a`. Restarted `telecloud-app` while `part_progress.phase=="uploading_telegram"` (24MB/500MB in); restart took only 4.1s (vs. 30.8s in the confounded run — consistent with a normal, unblocked shutdown this time). Recovery: `part_progress` cleared to `null`, `next_part_number` unchanged, healthy again within 25s. Re-PUT resumed and completed cleanly; the frontend's existing auto-finalize behavior (Phase 4) called `/complete` on its own once `next_part_number` passed `total_chunks`. Downloaded the finalized file and compared sha256 against the original: **`f4b064eac2a4d2edbdb52f94e17394ff930dc5191e08a9aac252c7dd8128619b` on both sides — exact match, zero corruption.** |
+| 2026-07-23 | 2 (`docker kill`, revised methodology) | **PASS (revised understanding)** | Session `36f0548f-0607-41fe-bdf1-181a1887deb7`, killed at 40MB/500MB. `docker kill` → `Exited (137)`, confirmed did **not** auto-restart even 51+s later — verified this is correct, documented Docker/kernel behavior (external kill from outside the PID namespace = deliberate operator action, `unless-stopped` respects it), not a bug. Separately verified an actual in-process crash (killing the uvicorn child, not PID 1, from inside the container) **does** auto-restart correctly (`healthy` within ~1 minute, zero manual intervention) — confirming `unless-stopped` itself works as designed; the original plan's test method (`docker kill`) just wasn't testing what it was assumed to test. See the revised Scenario 2 section above for the full experimental trail (including why `docker exec kill -9 1` silently no-ops due to `pid_namespaces(7)` protection). Recovery-mechanics verification (resume/checksum) not yet redone under this corrected method — same mechanics as Scenario 1, expected to hold, but not yet explicitly re-verified end-to-end after this specific crash path. |
