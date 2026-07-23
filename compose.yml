@@ -49,8 +49,12 @@ services:
   # Defined now so the compose architecture doesn't change shape later, but unused
   # until Phase 5B: telecloud-app's DATABASE_URL still points at Neon (see .env.app),
   # so this container starts and stays healthy but idle until the cutover.
+  # Pinned to 18-alpine (Phase 13, 2026-07-23) specifically to match Neon's actual
+  # server version (verified via `SELECT version()` against the real Neon endpoint,
+  # not assumed) -- pg_dump/restore across major versions is the riskier direction
+  # this project explicitly wants to avoid rather than discover mid-restore.
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: telecloud-postgres
     restart: unless-stopped
     logging: *default-logging
