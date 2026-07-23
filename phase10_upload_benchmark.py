@@ -79,17 +79,47 @@ def put_part(base_url: str, token: str, session_id: str, part_number: int, data:
 
 def poll_until_confirmed(base_url: str, token: str, session_id: str, part_number: int) -> dict:
     """Polls GET /uploads/{id} until this part clears from part_progress (confirmed).
-    Returns timing + the last-seen server-reported progress sample for cross-check."""
+    Returns timing + the last-seen server-reported progress sample for cross-check.
+
+    Deliberately tolerant of transient failures while the backend is down/restarting
+    (connection refused, 502/503/504 from nginx while its upstream is unreachable) --
+    per the Phase 3 lesson that polling clients must only treat a definitive 404 (session
+    truly gone) as fatal, not transient network blips. A resilience test that crashes the
+    moment the fault it's injecting takes effect would prove nothing."""
     telegram_start = None
     last_progress = None
+    outage_started = None
 
     while True:
-        body = _request("GET", f"{base_url}/uploads/{session_id}", token)
+        try:
+            body = _request("GET", f"{base_url}/uploads/{session_id}", token)
+        except SystemExit as e:
+            if "HTTP 404" in str(e):
+                raise SystemExit(f"Session {session_id} not found (404) -- treating as fatal: {e}")
+            if outage_started is None:
+                outage_started = time.monotonic()
+                print(f"  [live] backend unreachable ({e}) -- treating as transient, continuing to poll")
+            time.sleep(POLL_INTERVAL_SECONDS)
+            continue
+        except (OSError, ConnectionError) as e:
+            if outage_started is None:
+                outage_started = time.monotonic()
+                print(f"  [live] backend unreachable ({e}) -- treating as transient, continuing to poll")
+            time.sleep(POLL_INTERVAL_SECONDS)
+            continue
+
+        if outage_started is not None:
+            print(f"  [live] backend reachable again after {time.monotonic() - outage_started:.1f}s outage")
+            outage_started = None
+
         progress = body.get("part_progress")
 
         if progress and progress.get("phase") == "uploading_telegram":
             if telegram_start is None:
                 telegram_start = time.monotonic()
+                print(f"  [live] part {part_number} entered uploading_telegram phase -- safe to inject a fault now")
+            pct = (progress["bytes_done"] / progress["bytes_total"] * 100) if progress["bytes_total"] else 0
+            print(f"  [live] bytes_done={progress['bytes_done']} ({pct:.1f}%) speed_bps={progress['speed_bps']}")
             last_progress = progress
         elif progress is None and body["next_part_number"] > part_number:
             telegram_end = time.monotonic()
