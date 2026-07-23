@@ -9,6 +9,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Request, Depends, UploadFile, File, Form, Query
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel
+from telethon.tl.types import DocumentAttributeFilename
 
 from backend.auth import get_current_user, get_media_user
 from backend.database import (
@@ -592,7 +593,10 @@ async def upload(
         client = await get_user_client(telegram_user_id, require_authorized=True)
         for orig_name, path in saved:
             try:
-                msg = await client.send_file("me", path, force_document=True)
+                msg = await client.send_file(
+                    "me", path, force_document=True,
+                    attributes=[DocumentAttributeFilename(file_name=orig_name)],
+                )
                 mime = msg.file.mime_type or "application/octet-stream" if msg.file else "application/octet-stream"
                 size = msg.file.size or 0 if msg.file else 0
                 db_insert_file(
