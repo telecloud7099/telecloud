@@ -72,6 +72,18 @@ sanity check, but it is not blocked on vCPU count.
   either vCPU count due to the network conditions described above — it remains available
   and useful for a future real-world throughput check, but contributed no data to this
   phase's actual conclusion.
+- **Follow-up (2026-07-23): root-caused the network slowness.** Ran the same download test
+  (`speedtest.tele2.net/10MB.zip`) from the Windows host, outside the VM entirely, twice:
+  204,799 bytes/s (~200 KB/s) and 283,000 bytes/s (~276 KB/s). Both are in the same band as
+  the ~183 KB/s the VM guest saw through NAT for the same test. This rules out VirtualBox's
+  NAT engine as the bottleneck: the host gets the same order-of-magnitude speed with no
+  VM/NAT involved at all, and repeating the host test shows some natural run-to-run
+  variance (~40%) but no host-vs-guest gap. The real constraint is the underlying network
+  path (likely this connection's real upload/download asymmetry, and/or routing to that
+  specific distant test server), not anything VM-specific — meaning it will carry over
+  unchanged to the eventual i3-2120 home server on the same connection. The 47 KB/s Telegram
+  *upload* figure being even lower than the ~180-280 KB/s *download* figures across both
+  environments is consistent with typical home-connection upload/download asymmetry.
 - `cores_utilized` never approaching `thread_count` (even at 0.87 with 5 real vCPUs
   available) is itself worth a closer look at some point — it suggests `cryptg` may not be
   releasing the GIL during its C computation, which would mean concurrent uploads from
