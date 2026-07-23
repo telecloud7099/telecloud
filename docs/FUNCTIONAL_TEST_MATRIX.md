@@ -85,4 +85,4 @@ deviation noted.
 
 | Date | Commit | Items 1–6 (manual) | Items 7–8 (automated) | Notes |
 |---|---|---|---|---|
-| _(none yet)_ | | | | |
+| 2026-07-23 | `9639ef0` | 1 PASS, 2 PASS, 3 PASS, 4 PASS, 5 PASS, 6 PASS | 7 PASS, 8 PASS | Item 2: Cloud Password is enabled on the test account; verification completed successfully (not N/A). |
