@@ -263,8 +263,48 @@ backend during boot).
 
 ---
 
+## Observed findings during testing
+
+Findings surfaced while executing the scenarios above, kept separate from the scenario
+results themselves since they weren't anticipated by the original plan.
+
+### Stale client activity prolonged recovery after Scenario 1's restart (2026-07-23)
+
+**Observed, not a confirmed root cause.** During Scenario 1 (backend container restart
+mid-upload), re-PUTting the interrupted part failed repeatedly for 15+ minutes after
+`telecloud-app` reported `healthy` again, every time with `{"status":"error","message":
+"Could not connect to Telegram"}` (backend logs: `Telegram connection timed out. Please
+try again.` from `telegram_client.py`'s 12s connect timeout). A `docs/`-adjacent one-off
+diagnostic (`telethon_connect_debug.py`) connected and fully authenticated directly against
+Telegram in 0.35s during this same window, and independent checks (general HTTPS, raw TCP
+to a Telegram data center IP, `api.telegram.org`) all responded fast — ruling out a real
+Telegram-side or network-level outage as the cause.
+
+A browser tab left open from earlier testing, with many stale reattached upload sessions,
+was still issuing background requests (observed: `backend.routes.files` logging its own
+independent `Telegram connection timed out` error around the same times, from an incremental
+sync call unrelated to our upload). Closing that stale tab was immediately followed by the
+next PUT retry succeeding.
+
+**What we can say:** concurrent client activity (the stale tab) was present throughout the
+incident, and closing it immediately preceded recovery. **What we cannot yet say:** *why* —
+no instrumentation was added to directly observe lock contention, backoff-timer
+re-arming, or queuing inside `telegram_client.py`'s connection-pool state
+(`_clients`/`_get_lock`/`_connect_failed_at`) during the incident. The per-user lock/backoff
+mechanism in that file is a plausible-looking mechanism given the code shape, but it is a
+**leading hypothesis for a future phase to instrument and confirm**, not a diagnosed cause.
+
+**Why this matters for resilience testing regardless of root cause:** it demonstrates that
+concurrent client activity (multiple tabs/devices, or simply not cleaning up stale test
+sessions) can materially affect how long recovery takes after a restart — a real user
+scenario, not just a testing artifact. Worth a dedicated instrumented investigation before
+Phase 15's go/no-go, and worth remembering to close out stale sessions/tabs before future
+resilience runs so they don't confound results the way this one did.
+
+---
+
 ## Sign-off log
 
 | Date | Scenario | Result | Notes |
 |---|---|---|---|
-| _(none yet)_ | | | |
+| 2026-07-23 | 1 (restart mid-upload) | PASS (with caveat) | Recovery mechanics themselves correct (session stayed `uploading`, `part_progress` cleared, `next_part_number` unchanged, resumable via re-PUT) but recovery was prolonged 15+ min by the stale-client-activity finding above, unrelated to the restart/recovery logic itself. |
