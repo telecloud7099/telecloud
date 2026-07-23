@@ -207,6 +207,15 @@ healthy again, with `part_progress: null` and `next_part_number` unchanged.
 **Failure criteria:** the client treats a transient 502/504 as fatal and gives up before the
 backend recovers.
 
+**Verified 2026-07-23** with a dedicated standalone poller (`phase11_poll_resilience_test.py`)
+run continuously through a live `docker compose restart telecloud-app`, rather than inferred
+from before/after snapshots: `poll 12` hit a transient `HTTP 502` right as the outage began
+and logged it as non-fatal instead of stopping; `poll 24` logged `RECOVERED after 13.4s
+outage`; polls 25 through 94 (continued for over a minute after recovery) all returned normal
+`200` responses with `session_status`/`next_part_number` unchanged throughout. The poller
+never stopped polling at any point during the outage — directly confirming the client-side
+tolerance this scenario requires, not just the server-side recovery.
+
 ---
 
 ## Scenario 4 — Resume/completion without metadata corruption or orphaned chunks
@@ -392,3 +401,4 @@ to test; it surfaced as a side effect of the confounded run above.
 | 2026-07-23 | 1 (restart mid-upload) | PASS (with caveat) | First run: recovery mechanics correct (session stayed `uploading`, `part_progress` cleared, `next_part_number` unchanged, resumable via re-PUT) but recovery was prolonged 15+ min by the stale-client-activity finding above, unrelated to the restart/recovery logic itself. |
 | 2026-07-23 | 1 + 4 (clean redo: restart mid-upload, then resume/complete) | **PASS** | Clean run, no stale tab, fresh session `d6f4a62f-49d9-4a22-93bd-a973b130dc0a`. Restarted `telecloud-app` while `part_progress.phase=="uploading_telegram"` (24MB/500MB in); restart took only 4.1s (vs. 30.8s in the confounded run — consistent with a normal, unblocked shutdown this time). Recovery: `part_progress` cleared to `null`, `next_part_number` unchanged, healthy again within 25s. Re-PUT resumed and completed cleanly; the frontend's existing auto-finalize behavior (Phase 4) called `/complete` on its own once `next_part_number` passed `total_chunks`. Downloaded the finalized file and compared sha256 against the original: **`f4b064eac2a4d2edbdb52f94e17394ff930dc5191e08a9aac252c7dd8128619b` on both sides — exact match, zero corruption.** |
 | 2026-07-23 | 2 (`docker kill`, revised methodology) | **PASS (revised understanding)** | Session `36f0548f-0607-41fe-bdf1-181a1887deb7`, killed at 40MB/500MB. `docker kill` → `Exited (137)`, confirmed did **not** auto-restart even 51+s later — verified this is correct, documented Docker/kernel behavior (external kill from outside the PID namespace = deliberate operator action, `unless-stopped` respects it), not a bug. Separately verified an actual in-process crash (killing the uvicorn child, not PID 1, from inside the container) **does** auto-restart correctly (`healthy` within ~1 minute, zero manual intervention) — confirming `unless-stopped` itself works as designed; the original plan's test method (`docker kill`) just wasn't testing what it was assumed to test. See the revised Scenario 2 section above for the full experimental trail (including why `docker exec kill -9 1` silently no-ops due to `pid_namespaces(7)` protection). Recovery-mechanics verification (resume/checksum) not yet redone under this corrected method — same mechanics as Scenario 1, expected to hold, but not yet explicitly re-verified end-to-end after this specific crash path. |
+| 2026-07-23 | 3 (polling survives transient errors) | **PASS** | Directly observed with a dedicated standalone poller (`phase11_poll_resilience_test.py`) run continuously through a live `docker compose restart telecloud-app` against session `36f0548f-...`, not inferred from before/after snapshots. `poll 12` hit a transient `HTTP 502` right as the outage began and correctly logged it as non-fatal; `poll 24` logged `RECOVERED after 13.4s outage`; polls 25-94 (over a minute of continued polling) all returned normal, unchanged state. The poller never stopped polling at any point — confirms the client-side tolerance requirement directly, not just server-side recovery. |
