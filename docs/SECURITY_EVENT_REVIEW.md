@@ -1,0 +1,68 @@
+# Security Event Review
+
+Phase 12 deliverable — a lightweight way to review `backend/security.py`'s
+`log_security_event()` output without standing up a full SIEM/observability stack, per
+`SECURITY_ARCHITECTURE.md`'s item 10 (Monitoring & intrusion detection) which specifically
+calls out suspicious-login alerting as an early target "since `backend/security.py` already
+logs the data."
+
+## Format
+
+Every call site logs a single plain-text line via stdlib `logging`:
+```
+SECURITY EVENT: type=<TYPE> ip=<ip> phone=<phone or None> ua=<user-agent> details=<details>
+```
+
+## Event types that exist today (2026-07-23, verified via grep)
+
+`log_security_event()` call sites currently in the codebase:
+
+| Type | File:line |
+|---|---|
+| `OTP_SENT` | `backend/routes/auth.py:131` |
+| `LOGIN_FAILED` | `backend/routes/auth.py:184` |
+| `LOGIN_SUCCESS` | `backend/routes/auth.py:249` |
+| `LOGOUT` | `backend/routes/auth.py:274` |
+| `DATA_DELETED` | `backend/routes/auth.py:296` |
+| `UPLOAD_SESSION_CREATED` | `backend/routes/upload.py:87` |
+| `UPLOAD_SESSION_COMPLETED` | `backend/routes/upload.py:189` |
+| `UPLOAD_SESSION_ABORTED` | `backend/routes/upload.py:216` |
+| `FOLDERS_LISTED` | `backend/routes/folders.py:28` |
+| `FOLDER_CREATED` | `backend/routes/folders.py:72` |
+| `FOLDER_RENAMED` | `backend/routes/folders.py:107` |
+| `FOLDER_DELETED` | `backend/routes/folders.py:124` |
+| `FILES_LISTED` | `backend/routes/folders.py:155` |
+| `FILES_UPLOADED` | `backend/routes/files.py:632` |
+| `FILES_MOVED` | `backend/routes/files.py:671` |
+| `FILES_DELETED` | `backend/routes/files.py:718` |
+
+This list is informational only — `security_event_summary.py` does **not** hardcode it;
+the script auto-discovers whatever types actually appear in a given log window, so a new
+call site added later needs no change here or in the script to show up in the summary.
+
+## Usage
+
+```bash
+docker compose logs telecloud-app | python3 security_event_summary.py
+docker compose logs --since 24h telecloud-app | python3 security_event_summary.py
+```
+
+Two layers of output:
+1. **Generic summary** — count of every event type present in the input window.
+2. **Login-failure clustering** (a separate analysis layer on top of the generic summary,
+   not baked into the core parsing) — flags any single `ip` or `phone` with 3+
+   `LOGIN_FAILED` events in the window, printing each flagged event's timestamp/details.
+
+**✅ Verified (2026-07-23):** tested against synthetic input containing a 3-failure burst
+from one IP/phone plus five other event types (including a made-up type not in the table
+above) — the generic summary correctly counted all five types with no script changes
+needed, and the clustering layer correctly flagged the burst by both IP and phone.
+
+## What this is (and isn't)
+
+This is an **on-demand review tool**, not a running daemon/alerting pipeline — matching the
+Phase 12 decision to stay lightweight rather than build a real-time SIEM for a personal
+home-server project. Run it manually, or via a cron job piping into a file/email, if a
+scheduled check becomes useful later. Treat `security_event_summary.py` as an operational
+tool, not application code — it's not covered by the app's own test suite or deployment
+pipeline.
