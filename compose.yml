@@ -115,6 +115,27 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    # Phase 14b (2026-07-24): PID 1 already confirmed running as uid 70
+    # (postgres, non-root) by the time it's serving -- the official
+    # entrypoint starts as root briefly to fix ownership/permissions before
+    # gosu-ing to postgres, hence the CHOWN/DAC_OVERRIDE/FOWNER/SETUID/SETGID
+    # set (covers that root phase, not the long-running server). The data
+    # directory itself is a bind mount (/var/lib/postgresql), unaffected by
+    # read_only regardless -- tmpfs only needed for the socket dir and /tmp.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql
+      - /tmp
 
 networks:
   edge:
