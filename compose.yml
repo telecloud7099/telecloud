@@ -45,6 +45,20 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    # Phase 14b (2026-07-24): already ran with zero effective Linux capabilities
+    # before this (confirmed via /proc/1/status -- non-root appuser never held
+    # any of Docker's default bounding set), so cap_drop is defense-in-depth
+    # (shrinks the bounding set too) rather than a functional change. uploads/
+    # thumbs are bind-mounted outside the rootfs already; /tmp is the only
+    # other writable path given a tmpfs, as safe insurance -- confirmed empty
+    # under normal operation but no code path proven to never need it.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
 
   # Defined now so the compose architecture doesn't change shape later, but unused
   # until Phase 5B: telecloud-app's DATABASE_URL still points at Neon (see .env.app),
