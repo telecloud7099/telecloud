@@ -1,0 +1,8 @@
+[Unit]
+Description=Phase 15 stability test monitoring snapshot
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/telecloud/app/phase15_stability_snapshot.sh
+User=roy

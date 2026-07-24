@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Phase 15 stability snapshot every 15 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=15min
+Persistent=false
+
+[Install]
+WantedBy=timers.target
