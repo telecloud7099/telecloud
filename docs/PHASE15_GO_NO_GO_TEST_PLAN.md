@@ -106,6 +106,37 @@ final pre-migration checkpoint — not relying on the Phase 13 result alone, sin
 data has changed since then. **Pass**: same bar as Phase 13 (row counts, content
 checksums, ORM-layer read all matching).
 
+**Result: PASS, 2026-07-24.** Followed `docs/DISASTER_RECOVERY_RUNBOOK.md` exactly, no
+deviation from the documented procedure. Version parity reconfirmed (both local and
+Neon at PostgreSQL 18.4). Backup: ~23s, 129,023 bytes. Restore: exit code 1 with 13
+errors, all `ALTER TABLE/DEFAULT PRIVILEGES ... TO neondb_owner/neon_superuser` —
+identical class of error to Phase 13, zero `CREATE TABLE`/`COPY` failures. Row counts
+matched exactly on all 9 tables (`files=1741`, up from Phase 13's 1737, consistent
+with normal usage growth). Content checksum matched exactly
+(`334ac2e45d4f1d1735ccdb8755ac3f27`) on both sides. ORM-layer verification
+(`phase13_verify_orm.py`): zero exceptions, correct category/status breakdowns. Live
+app confirmed functional after the full drill (login/list), with one recurrence of the
+already-documented item-3 rate-limit artifact (nginx `auth` zone, same NAT-shared
+client IP) — not a new issue, confirmed via the same log-based diagnosis.
+
+**Two real operational findings surfaced by actually running the drill, not assumed:**
+1. **`docker cp` silently fails against a `read_only: true` container**, even when the
+   destination is a genuinely writable `tmpfs` mount. `docker cp rowcounts.sql
+   telecloud-postgres:/tmp/rowcounts.sql` reported "Successfully copied 528B" but the
+   file did not actually exist in `/tmp` afterward — `docker cp`'s archive-extraction
+   mechanism appears to fail a post-copy step against the read-only rootfs regardless
+   of the specific mount's own writability. `docker exec -i <container> sh -c 'cat >
+   /path' < localfile` works correctly and was used as the workaround throughout this
+   drill. **The runbook should be updated** (tracked as a follow-up, not done in this
+   phase) to use this pattern instead of `docker cp` now that Phase 14b's container
+   hardening is in place — Phase 13 predates that hardening, so the original runbook's
+   `docker cp` commands were correct when written.
+2. **`phase13_verify_orm.py` needs `PYTHONPATH=/app`** when run from `/tmp` instead of
+   `/app` — the script imports `backend.database`, which resolves via `/app` being on
+   the working directory in Phase 13's original (pre-14b, writable-`/app`) execution.
+   With `/app` now read-only, the script has to live in `/tmp` (the writable mount) but
+   still needs `/app` added to the import path explicitly.
+
 ### 7. Resource measurement under real load
 CPU/RAM/disk I/O/network measured during actual functional load (upload/download
 activity), not the synthetic cryptg-only benchmark from Phase 10 — this is the number
