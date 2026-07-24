@@ -27,6 +27,22 @@ iptables -F "$CHAIN"
 # packet against the port rule below (standard DOCKER-USER pattern).
 iptables -A "$CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$TAG" -j RETURN
 
+# Traffic that already originated from a container -- inter-container
+# traffic (nginx->telecloud-app, telecloud-app->postgres) and container
+# egress to the internet -- arrives on a Docker bridge interface, never on
+# the host's real external NIC, so it can never be genuinely-external
+# ingress. Return early so it falls through to Docker's own
+# DOCKER-FORWARD/DOCKER-BRIDGE rules, which already handle it correctly.
+# Without this, the port-80-only policy below also caught inter-container
+# traffic and broke the app (nginx -> telecloud-app 502, found empirically
+# 2026-07-24 right after the first real deployment -- this chain sees ALL
+# forwarded traffic, not just external ingress, because br_netfilter is
+# active). `br-+` wildcards any compose-managed bridge by prefix rather
+# than hardcoding today's specific per-network IDs, so this survives
+# `docker compose down`/`up` regenerating the networks later.
+iptables -A "$CHAIN" -i "br-+" -m comment --comment "$TAG" -j RETURN
+iptables -A "$CHAIN" -i docker0 -m comment --comment "$TAG" -j RETURN
+
 # --- nginx (80/tcp), the only Docker-published port in compose.yml ---
 # Stage: VM / NAT-only dev (current). Source deliberately left unscoped --
 # VirtualBox NAT already bounds real-world reachability to whatever the
