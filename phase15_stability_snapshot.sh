@@ -19,5 +19,10 @@ LOG="/opt/telecloud/app/phase15_stability.log"
   echo "--- container restart counts ---"
   docker inspect telecloud-app telecloud-nginx telecloud-postgres --format '{{.Name}}: RestartCount={{.RestartCount}}'
   echo "--- recent errors/crashes since last snapshot (app + nginx) ---"
-  docker compose logs telecloud-app nginx --since 16m 2>&1 | grep -iE "error|traceback|exception|crash" | tail -20
+  # grep exiting 1 on "no matches" is the GOOD outcome (no errors found), not a
+  # failure -- without `|| true`, pipefail propagates that 1 as this whole
+  # script's exit status, making every healthy run report "failed" to systemd
+  # and burying any real failure signal in false alarms. Found via a live
+  # test run, not assumed.
+  docker compose logs telecloud-app nginx --since 16m 2>&1 | grep -iE "error|traceback|exception|crash" | tail -20 || true
 } >> "$LOG" 2>&1
