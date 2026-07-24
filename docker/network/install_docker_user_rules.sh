@@ -18,7 +18,14 @@ sudo chmod 755 "$REPO_DIR/docker/network/docker-user-rules.sh"
 sudo cp "$REPO_DIR/docker/network/$UNIT_NAME" "/etc/systemd/system/$UNIT_NAME"
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now "$UNIT_NAME"
+sudo systemctl enable "$UNIT_NAME"
+# `restart`, not `enable --now` / `start`: for an already-active oneshot
+# unit, `start` is a no-op and won't re-run ExecStart even if
+# docker-user-rules.sh changed underneath it -- found the hard way on
+# 2026-07-24 when a script fix silently failed to apply because the unit
+# was already "active (exited)" from the prior install. `restart` always
+# re-executes ExecStart regardless of current state.
+sudo systemctl restart "$UNIT_NAME"
 
 echo "--- unit status ---"
 sudo systemctl status "$UNIT_NAME" --no-pager
