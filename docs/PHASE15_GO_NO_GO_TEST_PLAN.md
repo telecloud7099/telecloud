@@ -37,7 +37,25 @@ digest pins still match, no unreviewed drift). **Pass**: every check matches its
 Phase 14 baseline exactly; any difference is investigated before proceeding, not
 waved through.
 
-### 3. Vercel frontend ↔ backend integration — **OPEN DECISION, see below**
+### 3. Frontend production-build ↔ VM backend integration
+Resolved 2026-07-24: validates the same build/API contract Vercel would ship, without
+any exposure change to the VM (public internet, Cloudflare Tunnel, and TLS stay out of
+scope until the later production deployment).
+
+`VITE_API_URL` (`frontend/src/api/client.ts`) is a Vite **build-time** env var, not
+runtime — so the production build itself must be built pointed at the VM, not just
+previewed that way:
+```bash
+cd frontend
+VITE_API_URL=http://127.0.0.1:8080 npm run build
+npm run preview -- --port 5173
+```
+Port `5173` deliberately chosen over Vite's preview default (`4173`): `backend/main.py`'s
+`ALLOWED_ORIGINS` CORS allow-list already defaults to `http://localhost:5173,http://localhost:5001`
+(the existing dev-server origin), so this needs zero backend/`.env.app` changes on the VM.
+**Pass**: login/upload/download/etc. all function correctly through the real production
+build talking to the VM over the NAT-forwarded endpoint, with no CORS errors in the
+browser console.
 
 ### 4. Long-duration stability test (24–48h)
 Real usage pattern (not synthetic) running against the VM for a sustained period,
@@ -83,31 +101,23 @@ new state (DOCKER-USER rules, container `read_only`/cap-drop settings, digest pi
 since Phase 11 last verified this, and none of it has been exercised through a reboot
 cycle together as a whole system.
 
+### 10. Deployment reproducibility check (required before any Go verdict)
+Before the report can declare Go, document the exact, pinned state the i3-2120
+deployment would clone from source — not just "current `main`":
+- The exact `git` commit hash `HEAD` is at when testing concludes.
+- The exact digest-pinned base images in effect (`nginx`, `postgres`, `python`, `node`
+  — confirm via `patch_management_check.sh` section 3 that pinned == live, so there's
+  no last-minute drift between what was tested and what a fresh clone would build).
+- Confirmation that a **fresh `git clone` + `docker compose build` from that commit**,
+  not the existing built images, is what actually gets validated — since the i3-2120
+  deployment is a clone-from-Git, not a copy of the VM's running containers, testing
+  only the VM's already-built images wouldn't actually prove the fresh-build path
+  works. If practical, do at least one clean rebuild from a fresh clone in a scratch
+  directory on the VM as part of this check, rather than assuming `docker compose
+  build --no-cache` on the existing checkout is equivalent.
+
 ## Deliverable
-A written Go/No-Go report (`docs/PHASE15_GO_NO_GO_REPORT.md`) synthesizing all 9 areas
-with an explicit verdict, produced after execution — not a running commentary during
-it.
-
----
-
-## OPEN DECISION: item 3, Vercel frontend ↔ VM backend
-
-For the real Vercel deployment to reach the VM's backend as literally stated, the VM
-would need to be reachable from the public internet in some form (port-forward or a
-tunnel) — even temporarily, that's a real exposure action, and this VM currently has a
-**known-open stored-XSS finding** (`SECURITY_NOTES.md` issue #1) plus no TLS. Exposing
-it, even briefly and torn down immediately after, runs directly against the boundary
-you just drew between this phase and the production gate.
-
-Proposed alternative that tests the same integration contract without that exposure:
-run the Vercel-built frontend **locally** (`npm run preview` or equivalent against the
-production build) pointed at the VM's existing NAT-forwarded backend
-(`127.0.0.1:8080`) rather than using the real public Vercel URL. This exercises the
-identical built frontend code and CORS/API contract Vercel would serve, from a browser
-on your own machine, with zero exposure change. If that passes, the *code path* is
-proven; the *actual* Vercel-domain-to-real-backend connection only becomes relevant
-once TLS/Tunnel exist anyway (Vercel's frontend calling a plain-HTTP NAT'd backend
-over the internet wouldn't be a real deployment target regardless).
-
-Want me to proceed with that framing for item 3, or did you have a different mechanism
-in mind?
+A written Go/No-Go report (`docs/PHASE15_GO_NO_GO_REPORT.md`) synthesizing all 10
+areas with an explicit verdict, produced after execution — not a running commentary
+during it. The report must state the exact commit hash and image digests the Go
+verdict applies to; a later commit is a new, unvalidated state until re-verified.
