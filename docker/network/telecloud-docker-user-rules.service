@@ -1,0 +1,15 @@
+[Unit]
+Description=TeleCloud DOCKER-USER iptables policy (Phase 14a)
+Documentation=file:///opt/telecloud/app/docker/network/docker-user-rules.sh
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/telecloud/app/docker/network/docker-user-rules.sh
+# Re-running is safe (the script fully owns and rebuilds the chain), so a
+# plain restart is always sufficient to re-apply -- no ExecStop needed.
+
+[Install]
+WantedBy=multi-user.target
