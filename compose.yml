@@ -21,6 +21,28 @@ services:
     depends_on:
       telecloud-app:
         condition: service_healthy
+    # Phase 14b (2026-07-24): master process stays root (confirmed via live
+    # audit -- needs to bind port 80, a privileged port, and setuid/setgid to
+    # fork the unprivileged `nginx` worker processes), but everything else is
+    # dropped. This is nginx's own documented minimal set for exactly this
+    # pattern, not a guess -- verified empirically after applying. CHOWN is
+    # included even though the audit showed /var/cache/nginx's temp dirs
+    # already correctly owned at image-build time (so it may prove unneeded
+    # in practice) -- kept for now since removing it isn't proven safe either,
+    # revisit if a future audit wants to narrow further.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+      - CHOWN
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /run
 
   telecloud-app:
     build:
