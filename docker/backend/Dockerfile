@@ -5,7 +5,11 @@
 # frontend/vite.config.ts keeps the standard `dist` outDir so the Vercel deployment
 # (frontend/vercel.json, root-directory=frontend) keeps working unmodified. This stage
 # is the only place that knows the runtime image wants the build under static/app.
-FROM node:22-slim AS frontend-builder
+# Digest-pinned (Phase 14c, 2026-07-24) -- supply-chain integrity, not a vulnerability
+# fix: locks out a surprise/malicious tag repush, doesn't change CVE exposure. Confirmed
+# matching the digest already resolved on the VM before pinning (docker buildx imagetools
+# inspect), so this is a no-op for what's actually running today.
+FROM node:22-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
@@ -14,7 +18,7 @@ RUN npm run build
 
 
 # ---- Stage 2: python dependency build ----
-FROM python:3.13-slim AS python-builder
+FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91 AS python-builder
 WORKDIR /app
 
 # build-essential is a safety net, not a known requirement: cryptography/psycopg2-binary/
@@ -35,7 +39,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 
 # ---- Stage 3: runtime ----
-FROM python:3.13-slim AS runtime
+FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91 AS runtime
 
 # curl is required by compose.yml's healthcheck (GET /health); everything else psycopg2-
 # binary/cryptg need is bundled in their wheels, no libpq-dev or libssl-dev required here.

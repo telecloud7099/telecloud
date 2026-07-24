@@ -90,7 +90,11 @@ services:
   # not assumed) -- pg_dump/restore across major versions is the riskier direction
   # this project explicitly wants to avoid rather than discover mid-restore.
   postgres:
-    image: postgres:18-alpine
+    # Digest-pinned (Phase 14c, 2026-07-24) -- supply-chain integrity, not a
+    # vulnerability fix: locks out a surprise/malicious tag repush, doesn't
+    # change CVE exposure. Confirmed matching the digest already resolved on
+    # the VM before pinning.
+    image: postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     container_name: telecloud-postgres
     restart: unless-stopped
     logging: *default-logging
