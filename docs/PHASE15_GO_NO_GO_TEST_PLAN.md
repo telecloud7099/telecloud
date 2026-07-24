@@ -57,6 +57,35 @@ Port `5173` deliberately chosen over Vite's preview default (`4173`): `backend/m
 build talking to the VM over the NAT-forwarded endpoint, with no CORS errors in the
 browser console.
 
+**Result: PASS, 2026-07-24 — root cause of an initial false alarm fully confirmed.**
+The first test attempt showed `net::ERR_BLOCKED_BY_RESPONSE.NotSameOrigin` and a
+misleading "CORS blocked" browser error on `/verify_code`. Investigated rather than
+dismissed: `Cross-Origin-Resource-Policy: same-origin` (nginx, unconditional on every
+response, confirmed by reading `nginx.conf`) was the initial suspect but was ruled out
+by direct evidence — a clean Incognito reproduction still failed the same way, which a
+persistent CORP block wouldn't explain since nothing about CORP is session-scoped.
+
+**Actual root cause, confirmed directly from nginx's logs**: the `auth` rate-limit zone
+(`limit_req_zone ... rate=5r/m` shared across `check-phone`/`send_code`/`verify_code`/
+`verify_password`) was already exhausted from repeated testing. nginx's `limit_req`
+rejects with 429 *inside nginx*, before the request reaches FastAPI's `CORSMiddleware`
+— so the 429 response carries no CORS headers, and the browser reports that as a CORS
+failure instead of a rate-limit rejection, masking the real cause. This reproduced even
+in a fresh Incognito session because VirtualBox NAT collapses all Windows-host traffic
+to a single gateway IP (`10.0.2.2`) at nginx — the rate limit is server-side and
+IP-keyed, so no client-side session state resets it. Confirmed via
+`docker compose logs nginx`: explicit `limiting requests ... by zone "auth"` warnings
+immediately preceding each 429, and a clean `200` once the budget recovered.
+
+Not a frontend, CORS, or build bug — the thing this item needed to prove (production
+build + real cross-origin API contract against the VM backend) works correctly, shown
+by full functionality (login, folders, upload, download) once the rate-limit window
+passed. **Carried forward as a non-blocking note for the later production stage**: a
+legitimate rate-limited client sees a misleading "CORS blocked" error rather than a
+clear rate-limit signal, whenever the request is cross-origin (as it will be for the
+real Vercel/Railway or Tunnel-fronted deployment) — worth revisiting then, not a Phase
+15 gate.
+
 ### 4. Long-duration stability test (24–48h)
 Real usage pattern (not synthetic) running against the VM for a sustained period,
 monitored via `docs/OPERATIONS_RUNBOOK.md`'s existing tooling (`docker stats`,
