@@ -45,11 +45,17 @@ fail() {
 
 trap 'fail "unexpected_error"' ERR
 
-# pg_dump straight to a host-side file via stdout -- avoids `docker cp`
-# against a read_only container (known broken since Phase 14b hardening,
-# see docs/PHASE15_GO_NO_GO_TEST_PLAN.md item 6).
-docker compose exec -T postgres pg_dump "$DATABASE_URL" -Fc -f - > "$DUMP_FILE" \
+# -Fc (custom format) needs a real seekable file, not stdout via -f - (that
+# fails outright against the read_only container root -- confirmed live,
+# not assumed). Dump to the container's writable /tmp (a genuine tmpfs
+# mount, Phase 14b) instead, then stream it out with `cat` -- `docker cp` is
+# separately known broken against read_only containers (Phase 15 item 6).
+CONTAINER_DUMP="/tmp/backup_$(date +%Y%m%d_%H%M%S).dump"
+docker compose exec -T postgres pg_dump "$DATABASE_URL" -Fc -f "$CONTAINER_DUMP" \
   || fail "pg_dump"
+docker compose exec -T postgres cat "$CONTAINER_DUMP" > "$DUMP_FILE" \
+  || fail "pg_dump_stream_out"
+docker compose exec -T postgres rm -f "$CONTAINER_DUMP"
 
 DUMP_SIZE=$(stat -c%s "$DUMP_FILE")
 
