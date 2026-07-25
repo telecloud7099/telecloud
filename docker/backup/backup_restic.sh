@@ -18,11 +18,12 @@ flock -n 200 || { echo '{"status":"skipped","reason":"previous backup still runn
 
 cd "$APP_DIR"
 
-# .env.app: DATABASE_URL only, for pg_dump. .env.backup: restic/B2 credentials.
-# Sourced, never echoed -- both files are chmod 600 and this script never
-# prints their values.
+# DATABASE_URL extracted via grep/cut, not `source .env.app` -- matches the
+# proven pattern from docs/DISASTER_RECOVERY_RUNBOOK.md (a plain `source` of
+# the full file doesn't reliably export it, likely due to characters in the
+# connection string). .env.backup's simpler KEY=value pairs source cleanly.
+DATABASE_URL=$(grep '^DATABASE_URL=' "$APP_DIR/.env.app" | cut -d '=' -f2-)
 set -a
-source "$APP_DIR/.env.app"
 source "$APP_DIR/.env.backup"
 set +a
 
