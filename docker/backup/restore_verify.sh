@@ -110,10 +110,11 @@ done
 # scratch container using its own JWT_SECRET; never printed or logged.
 FOLDERS_STATUS=$(docker exec "$APP_CONTAINER" python3 -c "
 import jwt, os, datetime, urllib.request
+now = datetime.datetime.now(datetime.timezone.utc)
 token = jwt.encode(
     {'sub': '$FIRST_USER_ID',
-     'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1),
-     'iat': datetime.datetime.utcnow()},
+     'exp': now + datetime.timedelta(hours=1),
+     'iat': now},
     os.environ['JWT_SECRET'], algorithm='HS256')
 req = urllib.request.Request('http://localhost:8000/folders', headers={'Authorization': f'Bearer {token}'})
 import json
