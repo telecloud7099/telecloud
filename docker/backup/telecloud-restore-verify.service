@@ -1,0 +1,9 @@
+[Unit]
+Description=TeleCloud weekly restore verification (isolated, read-only w.r.t. production)
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/telecloud/app
+ExecStart=/opt/telecloud/app/docker/backup/restore_verify.sh
+User=roy
