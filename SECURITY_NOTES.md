@@ -7,18 +7,83 @@
 
 ---
 
-## 1. Stored XSS via innerHTML — `upload.html:281, 326, 359`
-**Severity: High** (see `SECURITY_ARCHITECTURE.md` §2) — blocks the Internet Exposure
-Checklist until fixed.
+## 1. Stored XSS via innerHTML — `upload.html:281, 326, 359` — **CLOSED, 2026-07-25**
+**Original severity: High** (see `SECURITY_ARCHITECTURE.md` §2) — was a hard gate on
+the Internet Exposure Checklist.
 
-File names from Telegram and folder names are injected directly into `innerHTML` without escaping. A crafted filename like `<img src=x onerror=alert(1)>` would execute JS in the browser.
+**Original finding:** file names from Telegram and folder names were injected directly
+into `innerHTML` without escaping in the old vanilla-JS/Jinja frontend
+(`upload.html`). A crafted filename like `<img src=x onerror=alert(1)>` would execute
+JS in the browser.
 
-**Affects:**
+**Affected (historical, pre-React-migration):**
 - `upload.html:326` — file card title (`file.name`)
 - `upload.html:359` — folder card title (`f`)
 - `upload.html:281` — preview modal header (`name`)
 
-**Fix:** Replace `innerHTML` with `textContent` for all user/server-supplied strings.
+**Closure investigation, 2026-07-25 — treated as a full security verification
+exercise, not a code-review assumption:**
+
+`upload.html` no longer exists — the frontend was fully rewritten in React/TypeScript
+between the original finding and now. Reconstructing the threat model against the
+*current* application, both static and runtime evidence were gathered before
+declaring this closed:
+
+1. **Static source review**: zero occurrences of `innerHTML`, `dangerouslySetInnerHTML`,
+   `document.write`, `eval(`, `javascript:`, or `srcdoc` anywhere in `frontend/src`.
+   Every `file.name`/`folder.name` render site (`FileCard.tsx`, `FolderGrid.tsx`,
+   `PreviewModal.tsx`, `Gallery.tsx`) uses JSX text interpolation (`{file.name}`) or a
+   standard JSX attribute (`title={file.name}`, `alt={file.name}`) — both auto-escaped
+   by React by design. No Markdown-rendering library exists in `package.json` (ruled
+   out as an alternate parsing path). The search query (`SearchBar.tsx`) is only ever
+   used as a controlled `<input value>` and a numeric result count — never rendered as
+   page content, so not a candidate injection point.
+2. **Folder-name runtime test**: created a folder named exactly
+   `<img src=x onerror=alert('XSS-FOLDER')>` through the live app. No alert fired.
+   DOM inspection (DevTools Elements panel) confirmed the payload renders as a literal
+   text node inside `<div class="card-title">` — no `<img>` element was created.
+3. **File-name runtime test**: uploaded a file via direct `curl` multipart request
+   (bypassing OS filename restrictions — Windows NTFS forbids `<`/`>`/`'` in
+   filenames, so this also better simulates the realistic attack surface of an
+   arbitrary filename string from an API call or Telegram-forwarded file, decoupled
+   from any real OS's naming rules) with filename
+   `<img src=x onerror=alert(2)>.txt`. Server response confirmed the payload was
+   stored completely unmodified — `{"status":"success","files":["<img src=x
+   onerror=alert(2)>.txt"]}` — so the test exercised the real, unsanitized value. No
+   alert fired. DOM inspection confirmed the same result as the folder-name test: a
+   literal text node inside `<div class="file-name">`, not a real `<img>` element.
+4. **Related investigation surfaced during this review — PDF-preview MIME
+   confusion** (a distinct, newly-identified *potential* attack surface, not part of
+   the original finding): `PreviewModal.tsx` renders PDF previews via an unsandboxed
+   `<iframe src={fileUrl(file.id)}>`, and the file's `mime_type` is fully
+   client-supplied at upload time (`upload.py`, no server-side content validation).
+   Tested directly: uploaded a file containing raw
+   `<html><body><script>alert(3)</script></body></html>` content, named `evil.pdf`,
+   declared as `application/pdf`. The upload succeeded and was correctly recognized
+   as a PDF by the preview UI (`file-type-icon: picture_as_pdf`), confirming the
+   iframe code path was genuinely exercised, not skipped. Result: Chrome's native PDF
+   viewer attempted to parse the content, failed, and displayed "Failed to load PDF
+   document" — it did **not** fall back to interpreting the mismatched content as
+   HTML. No alert fired. `nginx.conf`'s `X-Content-Type-Options: nosniff`
+   (`nginx.conf:87`) empirically confirmed to prevent this MIME-confusion path from
+   being exploitable in the tested browser (Chrome), not just assumed from the spec.
+   **Not treated as a confirmed vulnerability** — no execution was reproduced — but
+   logged here since it was investigated as part of this closure and future audits
+   should be able to see that it was considered, not missed.
+
+**Conclusion:** the original stored-XSS vulnerability does not exist in the current
+React implementation — eliminated structurally by the migration to JSX (which
+auto-escapes rendered content by default), not by a deliberate targeted fix, which is
+exactly why it had never been marked resolved until this investigation. Closed based
+on the combination of source review and three independent, DOM-verified runtime
+tests — not on the absence of `innerHTML` alone.
+
+**Hardening follow-up (not a vulnerability fix — the PDF-preview MIME-confusion path
+was tested and found not exploitable):** add a `sandbox` attribute to
+`PreviewModal.tsx`'s PDF-preview `<iframe>` as defense-in-depth, so the app doesn't
+rely on `nosniff` alone to prevent this class of issue. Verify it doesn't break the
+browser's built-in PDF viewer before merging; fall back to the minimal sandbox
+configuration that preserves functionality if the strictest setting breaks rendering.
 
 ---
 
@@ -172,12 +237,13 @@ pass/fail output should cross that channel.
 ---
 
 ## Notes
-- Severities reclassified 2026-07-22 against `SECURITY_ARCHITECTURE.md` §2: issue #1 is
+- Severities reclassified 2026-07-22 against `SECURITY_ARCHITECTURE.md` §2: issue #1 was
   **High**, issues #3 and #5 are **Medium**, issues #2 and #4 are **Low**.
-- Per `SECURITY_ARCHITECTURE.md` §4 (Internet Exposure Checklist), issue #1 is a hard
-  gate — TeleCloud may not be made reachable from the public internet until it's fixed.
-  Issue #5 (JWT in access logs) is not currently a hard gate but should be resolved or
-  explicitly re-evaluated before the home server's logs are shipped/backed up anywhere
-  off-box.
+- **Issue #1 closed 2026-07-25** — see the full evidence trail above. No longer a hard
+  gate on the Internet Exposure Checklist. `SECURITY_ARCHITECTURE.md` §4 item 1 and its
+  severity table should be updated to reflect this at the next checklist review.
+- Per `SECURITY_ARCHITECTURE.md` §4 (Internet Exposure Checklist), issue #5 (JWT in
+  access logs) is not currently a hard gate but should be resolved or explicitly
+  re-evaluated before the home server's logs are shipped/backed up anywhere off-box.
 - Issues #2–#5 don't block internet exposure but should still be addressed per the
   severity guidance in `SECURITY_ARCHITECTURE.md` §2.

@@ -72,7 +72,7 @@ label determines urgency, not the order findings happen to be discovered in.
 
 | Issue | Old label | New severity | Why |
 |---|---|---|---|
-| #1 Stored XSS (`innerHTML`) | "Fix before going public" | **High** | Requires a crafted filename to already exist somewhere the victim's own account can see (e.g. their own Telegram Saved Messages) — not remotely, unauthenticated exploitable against an arbitrary target, but a real account/token-theft path once reachable by anyone other than the operator. |
+| #1 Stored XSS (`innerHTML`) | "Fix before going public" | **CLOSED 2026-07-25** (was High) | Described a vulnerability in the pre-React `upload.html` frontend, which no longer exists. Closed via source review (zero `innerHTML`/`dangerouslySetInnerHTML` in the current React app, all user content rendered through JSX's default auto-escaping) plus three independent runtime tests with DOM-level verification (folder name, file name, and a related PDF-preview MIME-confusion path) — none reproduced execution. Full evidence trail in `SECURITY_NOTES.md` issue #1. |
 | #2 Content-Disposition filename | "Low" | **Low** | CRLF injection already blocked by the framework; residual risk is cosmetic. |
 | #3 Plaintext fallback for encrypted credentials | "Low" | **Medium** | Requires filesystem access to exploit today, but silently degrades a real security control (encryption at rest) without alerting anyone — the silence is what pushes this above a pure Low. |
 | #4 `phone_code_hash` not scoped to session | "Low" | **Low** | Still requires the OTP itself from another source to exploit. |
