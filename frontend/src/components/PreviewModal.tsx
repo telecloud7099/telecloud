@@ -112,6 +112,7 @@ export default function PreviewModal({ file, onClose }: Props) {
                 src={fileUrl(file.id)}
                 className="preview-pdf"
                 title={file.name}
+                sandbox=""
                 style={{ display: loaded ? 'block' : 'none' }}
                 onLoad={() => setLoaded(true)}
               />
