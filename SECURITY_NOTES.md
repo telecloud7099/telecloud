@@ -149,6 +149,110 @@ together rather than pick reflexively:
 
 ---
 
+## 6a. CVE Exploitability Assessments — Internet Exposure Checklist item 11
+
+**Verification date/environment: 2026-07-25, VM (`roy-VirtualBox`, Ubuntu 26.04),
+repo commit `00f0cf0`, digest-pinned images as of `patch_management_check.sh`'s
+2026-07-25 run** — `nginx:1.27-alpine@sha256:65645c7b...`,
+`postgres:18-alpine@sha256:9a8afca5...`, `python:3.13-slim@sha256:6771159c...`,
+`node:22-slim@sha256:6c74791e...`. These are **point-in-time risk assessments, not
+permanent exemptions** — each has explicit invalidating conditions below. Re-verify
+whenever the affected component's role changes, or at the latest by the next
+scheduled monthly pinned-image review (`PATCH_MANAGEMENT_POLICY.md`).
+
+### CVE-2026-31789 — OpenSSL heap buffer overflow (32-bit systems)
+- **Advisory:** https://nvd.nist.gov/vuln/detail/CVE-2026-31789
+- **Affected component:** `libssl3`/`libcrypto3`, present in `nginx:1.27-alpine`
+  (also inherited by the `telecloud-nginx` built image).
+- **Installed version:** `3.3.3-r0` (fixed in `3.3.7-r0`).
+- **Reason not reachable:** advisory is explicitly scoped to 32-bit systems.
+- **Verification:** `docker exec telecloud-app uname -m` and
+  `docker exec telecloud-nginx uname -m` both returned `x86_64` — confirmed
+  directly on the running containers, not assumed from the base image's published
+  platform tag.
+- **Residual risk:** none identified at 64-bit. If a 32-bit build of these images
+  were ever used (no reason to expect this), this reopens immediately.
+- **Invalidating conditions:** deployment moves to a 32-bit host/image (not planned;
+  would also be a major, deliberate architecture change).
+- **Recommended future action:** no urgency — will resolve naturally whenever
+  `nginx:1.27-alpine` is next bumped per the monthly pinned-image review.
+
+### CVE-2025-68121 — Go stdlib `crypto/tls` certificate validation
+- **Advisory:** https://nvd.nist.gov/vuln/detail/CVE-2025-68121
+- **Affected component:** `gosu` (privilege-drop helper) inside `postgres:18-alpine`.
+- **Installed version:** built with `go1.24.6` (`gosu --version` → `1.19 (go1.24.6
+  on linux/amd64; gc)`).
+- **Reason not reachable:** `gosu`'s only function is `setuid`/`setgid` +
+  `execve` of the target command (the official Postgres image's own privilege-drop
+  mechanism) — it makes no outbound network connections and has no TLS-client code
+  path, regardless of what's statically linked into the Go binary's dependency
+  closure.
+- **Verification:** confirmed `gosu` is the vulnerable binary via
+  `docker exec telecloud-postgres sh -c "which gosu; gosu --version"`; reachability
+  conclusion is based on `gosu`'s documented, single-purpose design (source review of
+  its known behavior, not a full binary disassembly).
+- **Residual risk:** low — depends on `gosu`'s upstream design not changing to add
+  networking, which is not expected of a purpose-built privilege-drop tool.
+- **Invalidating conditions:** if `gosu` (or its role in the postgres entrypoint) is
+  ever used for any network-facing purpose, or replaced with a different Go
+  binary that does make TLS client connections, this must be re-assessed.
+- **Recommended future action:** resolves naturally on the next `postgres:18-alpine`
+  pinned-image bump; no urgency given the reachability finding above.
+
+### CVE-2026-13221 — Perl silently-incorrect behavior
+- **Advisory:** https://nvd.nist.gov/vuln/detail/CVE-2026-13221
+- **Affected component:** `perl-base`, present in `python:3.13-slim`,
+  `node:22-slim`, and inherited by the built `telecloud-app` image.
+- **Installed version:** `5.40.1-6` (python/telecloud-app base), `5.36.0-7+deb12u3`
+  (node base — different Debian release per image).
+- **Reason not reachable:** `perl-base` is inherited OS-package weight from the
+  Debian slim base layer (commonly pulled in by `dpkg`/apt tooling), never invoked
+  by TeleCloud's own application code.
+- **Verification:** grepped the entire `backend/` tree for `perl`, `subprocess`,
+  `os.system`, `shell=True` — one substring match, which was a false positive on
+  "pro**perl**y" (a comment), not a real Perl invocation. Zero genuine references.
+- **Residual risk:** none identified — the interpreter is present on disk but never
+  executed by anything in this deployment's request path.
+- **Invalidating conditions:** if any future feature shells out to Perl, or a new
+  base-image tool/entrypoint script invokes it, this must be re-assessed.
+- **Recommended future action:** resolves naturally on the next base-image bump; no
+  urgency.
+
+### CVE-2026-59873 — npm `tar` package, DoS via crafted gzip bomb
+- **Advisory:** https://nvd.nist.gov/vuln/detail/CVE-2026-59873
+- **Affected component:** `tar`, found in the `node:22-slim` image scan.
+- **Installed version:** `7.5.11` (fixed in `7.5.19`).
+- **Reason not reachable:** not present anywhere in TeleCloud's own
+  `frontend/package-lock.json` — this is npm's own internally-bundled `tar` copy,
+  baked into the `node:22-slim` base image as part of the npm CLI itself, used only
+  by npm during our own controlled, integrity-checked `npm ci` against the public
+  npm registry. Never bundled into the shipped `dist/` output; never exposed to
+  attacker-controlled archive input in production.
+- **Verification:** `npm ls tar` in `frontend/` returned empty (not a resolved
+  dependency in our tree at all); grepped `package-lock.json` directly for any
+  `tar`-related entry — zero matches.
+- **Residual risk:** none identified in current usage. A gzip-bomb DoS requires
+  extracting an attacker-controlled archive; nothing in the build or runtime path
+  does that.
+- **Invalidating conditions:** if the build pipeline or the running application ever
+  extracts untrusted/attacker-supplied archives (not the case today), this must be
+  re-assessed.
+- **Recommended future action:** resolves naturally on the next `node:22-slim`
+  pinned-image bump; no urgency.
+
+**Summary:** none of these four packages were upgraded or patched — all four remain
+at their currently-pinned (nominally vulnerable) versions. What's documented above is
+that the specific vulnerable code path in each case is not reachable given how these
+components are actually used in this deployment, verified via a combination of
+runtime commands and source review, not assumed. Satisfies Internet Exposure
+Checklist item 11 ("no outstanding Critical/High CVEs... or documented evidence that
+identified findings are not exploitable in the current deployment") as a documented
+risk assessment, not a remediation. `PATCH_MANAGEMENT_POLICY.md`'s monthly
+pinned-image review is the mechanism that will naturally resolve all four the next
+time each base image is bumped.
+
+---
+
 ## 6. Environment File Architecture (Phase 6, 2026-07-22)
 
 Secrets are split by consumer so that compromising one container, or reading one file,

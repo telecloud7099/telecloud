@@ -63,6 +63,19 @@ chain) while adding maintenance overhead (would need updating every time the rea
 Dockerfile's pin changes, for zero actual benefit). Documented here explicitly so this
 reads as an intentional decision, not an oversight missed by Phase 14c's pinning pass.
 
+## CVE exploitability assessments
+
+When a monthly Trivy scan surfaces a Critical/High CVE against a pinned image,
+"documented not exploitable" is a valid alternative to immediate remediation — but
+only with the same evidence-first process used everywhere else in this project, not
+a reflexive dismissal. Individual assessments (affected component, verification
+method, residual risk, invalidating conditions, recommended action) are recorded in
+`SECURITY_NOTES.md` §6a, not duplicated here — this policy document just requires
+that they exist and get re-reviewed on the same monthly cadence as the pinned-image
+check above, since the "point in time" nature of an exploitability assessment means
+it can be invalidated by anything from a base-image bump to a new feature exercising
+a previously-dormant code path.
+
 ## Reusable tooling
 
 `patch_management_check.sh` (repo root) — read-only, run on the cadences above. Verified
