@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
+import { toast } from 'sonner'
 import { useStore } from '../store'
+import { abortUploadSession } from '../api/client'
 import { fmtSpeed, fmtEta, fmtElapsed } from '../utils/format'
+import ConfirmModal from './ConfirmModal'
 
 interface Props {
   /** Navigate to where the file will land — a folder view, or All Files if none. */
@@ -18,6 +21,36 @@ const PHASE_LABEL: Record<string, string> = {
 export default function UploadWidget({ onNavigate }: Props) {
   const uploads = useStore(s => s.uploads)
   const removeUpload = useStore(s => s.removeUpload)
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
+
+  // A chunked upload still in flight (or paused/recovered) has a real server-side session
+  // backing it — dismissing it without aborting that session just hides the widget; the
+  // session survives and reattaches on the next dashboard load, looking like it "came back".
+  // Only these need a confirm-and-abort; a finished/errored entry or a small single-shot
+  // batch upload has no resumable session to lose, so those still dismiss immediately.
+  function hasLiveSession(u: { status: string; phase: string }) {
+    return u.status === 'uploading' && u.phase !== 'batch'
+  }
+
+  function requestDismiss(u: { id: string; status: string; phase: string }) {
+    if (hasLiveSession(u)) {
+      setConfirmDeleteId(u.id)
+    } else {
+      removeUpload(u.id)
+    }
+  }
+
+  async function confirmDismiss() {
+    const id = confirmDeleteId
+    setConfirmDeleteId(null)
+    if (!id) return
+    try {
+      await abortUploadSession(id)
+    } catch {
+      toast.error('Failed to cancel upload — it may still be running')
+    }
+    removeUpload(id)
+  }
 
   // Elapsed time has to keep advancing even between progress updates (e.g. while paused,
   // or between sparse poll ticks on a recovered session) — a 1s clock forces that re-render.
@@ -52,8 +85,8 @@ export default function UploadWidget({ onNavigate }: Props) {
               <span className="upload-widget-item-name">{u.fileName}</span>
               <button
                 className="upload-widget-item-close"
-                onClick={e => { e.stopPropagation(); removeUpload(u.id) }}
-                title="Dismiss"
+                onClick={e => { e.stopPropagation(); requestDismiss(u) }}
+                title={hasLiveSession(u) ? 'Cancel upload' : 'Dismiss'}
               >
                 <span className="material-symbols-rounded">close</span>
               </button>
@@ -91,6 +124,14 @@ export default function UploadWidget({ onNavigate }: Props) {
           </div>
         ))}
       </div>
+      {confirmDeleteId && (
+        <ConfirmModal
+          message="Cancel this upload? It cannot be resumed — any parts already sent will be removed."
+          danger
+          onConfirm={confirmDismiss}
+          onCancel={() => setConfirmDeleteId(null)}
+        />
+      )}
     </div>
   )
 }

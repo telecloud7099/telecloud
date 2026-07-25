@@ -94,6 +94,57 @@ container restarts, no memory-growth trend, log rotation still bounding disk usa
 proven in Phase 12.
 
 ### 5. Large-file upload/download/resumable transfer
+
+**Investigation note, 2026-07-24/25**: mid-execution, three unrelated upload
+sessions for `video_2026-07-22_20-48-25.mp4` (12:35, 14:50, 15:48 on 2026-07-24)
+were discovered interleaved with `testfile_2gb.bin`'s session in the dashboard,
+initially raising concern about a session/file-identity mismatch bug. Traced
+methodically before any code change:
+- `reattachActiveUploads()`/`watchUploadSession()` (`Dashboard.tsx`,
+  `chunkedUpload.ts`) are account-scoped, not tab-scoped — any browser logged
+  into the account displays and passively finalizes *every* active session on
+  the account on load, which is why one VM Firefox tab showed both the video
+  sessions and our own `testfile_2gb.bin` session (`7b085556-...`) together.
+  This is working as designed, not a bug.
+- All three video sessions were created via genuine `POST /uploads` calls
+  (`ip=172.19.0.1`, Firefox/Ubuntu — the VM's own desktop browser), which only
+  happens on an actual `UploadZone.tsx` form submission. No code path
+  auto-creates sessions.
+- Ruled out by direct evidence, in order: a stale/forgotten browser tab (only
+  one TeleCloud tab open, confirmed on the VM desktop), other Firefox
+  windows/workspaces (`wmctrl`), browser-automation tooling (Playwright/
+  Selenium/Puppeteer/Cypress — no matching processes, no matching repo files),
+  user and system cron (`crontab -l` empty, `/etc/cron.d` and `/etc/crontab`
+  stock Ubuntu only), all systemd timers (`systemctl list-timers --all` — only
+  `phase15-stability.timer` plus stock OS timers), and `/uploads` calls in
+  bash history (none).
+- **Conclusion**: genuine manual uploads unrelated to Phase 15 testing, not an
+  application correctness issue. `7b085556-...` (`testfile_2gb.bin`, correct
+  filename/size, `ip=10.0.2.2` matching the Windows/Chrome NAT path) was
+  unaffected throughout. Resuming item 5 execution.
+
+**Two genuine usability findings, 2026-07-25** (discovered attempting to
+resume `7b085556-...` after the investigation above; not blocking, tracked as
+follow-ups):
+
+1. **Missing resume affordance.** `UploadWidget.tsx`'s paused-state hint text
+   ("Reattach this file to resume — the upload is paused, not lost.") is
+   plain, non-interactive text — no `onClick`, no file input, no button behind
+   it. The widget's only click handler navigates to the file's folder (or All
+   Files), not to any resume action. The UI instructs an action it provides no
+   control for. The actual resume path — go to the Folders view, re-select the
+   original file via `UploadZone`'s dropzone, submit again — is undiscoverable
+   from the hint text alone.
+2. **Cross-browser resume creates a silent duplicate session.** Resume
+   depends on a `resumeKey()` entry in the *initiating* browser's
+   `localStorage` (`chunkedUpload.ts`). Since `reattachActiveUploads()` shows
+   every account session in *any* browser (per the investigation above),
+   attempting the resume steps in a different browser/profile than the one
+   that started the upload finds no local match and silently starts a brand
+   new session instead of resuming — no error, no warning to the user. This
+   is exactly the kind of mixup that made the investigation above necessary,
+   and would recur for any user who switches devices/browsers mid-upload.
+
 Extend Phase 9's matrix with genuinely large files (proposing multi-GB — exact size TBD
 based on realistic real-world usage) through the full chunked/resumable path,
 including a deliberate interrupt-and-resume mid-transfer. **Pass**: byte-for-byte
