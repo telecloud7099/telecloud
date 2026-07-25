@@ -1,0 +1,9 @@
+[Unit]
+Description=TeleCloud encrypted offsite backup (restic + Backblaze B2)
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/telecloud/app
+ExecStart=/opt/telecloud/app/docker/backup/backup_restic.sh
+User=roy
