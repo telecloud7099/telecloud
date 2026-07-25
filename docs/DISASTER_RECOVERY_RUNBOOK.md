@@ -1,9 +1,13 @@
 # Disaster Recovery Runbook — PostgreSQL Backup & Restore
 
-Phase 13 deliverable. Every step below was actually executed and verified on this VM on
-2026-07-23 against the real production Neon database (not a synthetic stand-in) — this is
-a proven procedure, not a theoretical one. Repo commits `28ce356`, `8895256`, `0c41d22`
-correspond to the config/tooling changes made along the way; this doc is the narrative.
+Phase 13 deliverable, extended Phase 15 with automated encrypted offsite backups
+(`docs/BACKUP_POLICY.md`) and this document's §6/§7 below. Every step in §0-5 was
+actually executed and verified on this VM on 2026-07-23 against the real production
+Neon database (not a synthetic stand-in) — this is a proven procedure, not a
+theoretical one. Repo commits `28ce356`, `8895256`, `0c41d22` correspond to the
+config/tooling changes made along the way; this doc is the narrative.
+
+**RPO/RTO:** see `docs/BACKUP_POLICY.md` — 24h / under 2h.
 
 **✅ verified** marks something directly observed this session. **⚠️ not yet exercised**
 marks something this runbook assumes but hasn't been tested end-to-end (e.g., recovering
@@ -178,3 +182,112 @@ v18 container is stable — it was never real production data, just an idle empt
 - **Row-count parity and content parity are different checks** — do both. Row counts alone
   would not catch a scenario where the right number of rows exist but with wrong/corrupted
   field values.
+
+---
+
+## 6. Secrets required for a complete recovery
+
+Preserving these (values, not this list — this document intentionally records only
+*names* and where they normally live) is what actually determines whether recovery is
+possible at all. Losing any of these turns an otherwise-working backup into
+unusable data.
+
+| Secret | Normally lives in | Required for | If lost |
+|---|---|---|---|
+| `RESTIC_PASSWORD` | `.env.backup`, **and a copy outside this VM (password manager, etc.)** | Decrypting any restic snapshot | **Catastrophic and unrecoverable.** Every snapshot in B2 becomes permanently undecryptable. This is the single most important secret in the entire backup system — see `docs/BACKUP_POLICY.md`. |
+| B2 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `.env.backup` | Reading/writing the B2 bucket | Recoverable — regenerate a new bucket-scoped application key from the Backblaze dashboard, update `.env.backup`. Doesn't affect existing snapshot data. |
+| `ENCRYPTION_KEY` | `.env.app` | Decrypting `StringSession`/API-credential rows in the restored database | **Catastrophic for Telegram connectivity specifically.** Without it, the restored `users`/`user_api_credentials` rows exist but their Telegram sessions can never be decrypted — equivalent to every user needing to re-authenticate via OTP from scratch. File data on Telegram itself is unaffected. |
+| `JWT_SECRET` | `.env.app` | Validating/issuing login sessions | Low impact if lost — regenerate a new value; every existing JWT is invalidated and all users must log in again, no data risk (same as the routine rotation procedure in `SECURITY_NOTES.md` §6). |
+| `POSTGRES_PASSWORD` | `.env.db` | Local Postgres container auth | Low impact if lost — regenerate, update `.env.db`, recreate the container. Doesn't affect Neon or restic-backed data. |
+| Telegram API credentials (`api_id`/`api_hash`, if self-hosted rather than per-user) | Wherever originally configured (see `docs/PHASE2/6` setup) | Establishing new Telegram client connections | Depends on scope — check current app config; this runbook doesn't assume a specific storage location since it may be per-user (`user_api_credentials`, covered by `ENCRYPTION_KEY` above) rather than a single shared app-level credential. |
+
+**Practical implication:** a full recovery is only actually possible if `RESTIC_PASSWORD`
+and `ENCRYPTION_KEY` both survive whatever destroyed the VM. Neither should ever exist
+in only one place. Verify both have a current copy stored outside this machine whenever
+either is rotated.
+
+---
+
+## 7. Total-loss recovery — starting from a bare machine
+
+Unlike §1-5 (a live-VM drill), this procedure assumes the VM itself is gone —
+provisioning a genuinely new machine with nothing on it but internet access. Written so
+someone unfamiliar with this project's history could follow it end to end.
+
+### 7.1. Prerequisites before starting
+
+You need, from outside the destroyed machine (per §6's inventory):
+- `RESTIC_PASSWORD` and the B2 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (to reach
+  the offsite backup at all).
+- `ENCRYPTION_KEY` (to decrypt restored Telegram sessions — without it, treat this as
+  a metadata-only recovery and expect to re-authenticate all users via OTP).
+- `JWT_SECRET` and `POSTGRES_PASSWORD` (regenerable if lost, not required to already
+  have them).
+- Access to this git repository.
+
+### 7.2. Provision the new host
+
+```bash
+sudo apt update && sudo apt install -y git docker.io docker-compose-plugin restic
+sudo usermod -aG docker $USER   # then re-login/reboot for group membership to apply
+git clone <repo-url> /opt/telecloud/app
+cd /opt/telecloud/app
+```
+Confirms cleanly per Phase 15 item 10's reproducibility check — a fresh clone + build
+at a known-good commit is proven to work, not assumed.
+
+### 7.3. Recreate the secret files
+
+```bash
+cp .env.app.example .env.app      # fill in DATABASE_URL, ENCRYPTION_KEY, JWT_SECRET, etc.
+cp .env.db.example .env.db        # fill in POSTGRES_USER/PASSWORD/DB
+cp .env.backup.example .env.backup  # fill in AWS_*, RESTIC_REPOSITORY, RESTIC_PASSWORD
+chmod 600 .env.app .env.db .env.backup
+```
+Use the actual preserved values from §6 for `ENCRYPTION_KEY`/`RESTIC_PASSWORD`/B2
+credentials — everything else can be freshly generated.
+
+### 7.4. Restore the database from the offsite backup
+
+```bash
+docker compose up -d postgres
+# wait for healthy:
+docker compose ps
+
+set -a; source .env.backup; set +a
+restic snapshots                          # confirm the expected snapshot is visible
+restic restore latest --target /tmp/recovery
+docker cp /tmp/recovery/*.dump telecloud-postgres:/tmp/recovery.dump
+docker compose exec postgres pg_restore -U telecloud -d telecloud /tmp/recovery.dump
+```
+Expect the same harmless ownership-error pattern documented in §2 (`ALTER TABLE ...
+OWNER TO neondb_owner`) — not a failure signal on its own. Verify per §3's row-count
+and checksum queries before proceeding.
+
+### 7.5. Bring up the full stack
+
+```bash
+docker compose build --no-cache
+docker compose up -d
+docker compose ps            # all three healthy
+curl -f http://localhost/health
+```
+
+### 7.6. Re-establish automation
+
+```bash
+sudo cp docker/backup/telecloud-backup.service docker/backup/telecloud-backup.timer \
+        docker/backup/telecloud-restore-verify.service docker/backup/telecloud-restore-verify.timer \
+        /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now telecloud-backup.timer telecloud-restore-verify.timer
+```
+If `docker/network/telecloud-docker-user-rules.service` (Phase 14a) also needs
+reinstalling on the new host, see `docs/PHASE14A_NETWORK_HARDENING.md`.
+
+### 7.7. Final verification
+
+Run the full functional test matrix (`docs/FUNCTIONAL_TEST_MATRIX.md`) against the
+recovered instance before considering recovery complete — a restored database and a
+healthy container status are necessary but not sufficient; a real login/upload/download
+pass is what actually confirms service is restored.
