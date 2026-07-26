@@ -1,0 +1,9 @@
+[Unit]
+Description=TeleCloud security event clustering check
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/telecloud/app
+ExecStart=/opt/telecloud/app/docker/monitoring/security_alert.sh
+User=roy

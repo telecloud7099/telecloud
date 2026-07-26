@@ -1,6 +1,7 @@
 [Unit]
 Description=TeleCloud encrypted offsite backup (restic + Backblaze B2)
 After=docker.service
+OnFailure=telecloud-notify-failure@%n.service
 
 [Service]
 Type=oneshot

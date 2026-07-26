@@ -1,0 +1,9 @@
+[Unit]
+Description=TeleCloud container health monitor
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/telecloud/app
+ExecStart=/opt/telecloud/app/docker/monitoring/health_monitor.sh
+User=roy

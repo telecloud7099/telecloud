@@ -1,6 +1,7 @@
 [Unit]
 Description=TeleCloud weekly restore verification (isolated, read-only w.r.t. production)
 After=docker.service
+OnFailure=telecloud-notify-failure@%n.service
 
 [Service]
 Type=oneshot

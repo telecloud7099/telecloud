@@ -1,0 +1,7 @@
+[Unit]
+Description=Send ntfy alert for failed unit %I
+
+[Service]
+Type=oneshot
+ExecStart=/opt/telecloud/app/docker/monitoring/notify_failure.sh %I
+User=roy
