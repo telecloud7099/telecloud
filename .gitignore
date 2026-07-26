@@ -2,6 +2,8 @@
 .env
 .env.app
 .env.db
+.env.backup
+.env.monitoring
 
 # Telegram sessions (never commit — these are login credentials)
 sessions/
