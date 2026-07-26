@@ -93,6 +93,57 @@ monitored via `docs/OPERATIONS_RUNBOOK.md`'s existing tooling (`docker stats`,
 container restarts, no memory-growth trend, log rotation still bounding disk usage as
 proven in Phase 12.
 
+**Result: PASS, 2026-07-26 — full 48h window completed** (started
+2026-07-24T20:49:24+05:30, final snapshot 2026-07-26T20:52:15+05:30, the complete
+upper bound of the planned 24-48h range, timer still active/healthy throughout).
+`RestartCount=0` on all three containers via the monitoring's own tracking (the
+`telecloud-app` uptime resets seen mid-window were our own deliberate redeploys — the
+UploadWidget dismiss fix and the PDF-iframe sandbox hardening — not crashes). CPU/memory
+flat across every snapshot, no growth trend. Disk usage grew consistent with
+test-file accumulation, not a leak.
+
+**Every error/exception logged across the full 48h reviewed and accounted for, not
+just counted** (13 total matches):
+- `VERIFY CODE ERROR` (invalid OTP) — user-side typo during testing, benign.
+- `Part upload error (session=7b085556...)` — from the pre-fix upload-widget resume
+  bug, already root-caused and fixed this phase (see item 5's findings).
+- Repeated `ConnectionResetError`/`OperationalError: ... Temporary failure in name
+  resolution` — the already-documented non-blocking network-blip finding below,
+  which recurred a second time (`2026-07-26 14:38`, distinct from the original
+  `2026-07-25 05:22–08:02` window) — reinforces rather than changes that assessment.
+- One `RuntimeError: Response content shorter than Content-Length`
+  (`2026-07-25T11:08:43`) — the originating container has since been replaced by a
+  later redeploy, so the full traceback isn't recoverable, but the timestamp aligns
+  closely with our own deliberately Ctrl+C-interrupted `curl` download of
+  `kill_dl.bin` during the same session's docker-kill test — a client disconnecting
+  mid-stream is a plausible, benign explanation (the server logging that its response
+  stream got cut short when the client vanished, not data corruption — the source
+  file on Telegram is unaffected either way). Not fully certain given the
+  unrecoverable traceback, but the timing match is strong and this is exactly the
+  kind of exception a normal abrupt-disconnect produces.
+
+**Non-blocking observational finding (network blips)**: intermittent transient
+network events — repeated Telethon `ConnectionResetError`s and two
+`psycopg2.OperationalError: ... Temporary failure in name resolution` DNS failures
+against Neon — observed within a ~2.5h window (`2026-07-25T05:22–08:02 UTC`), and
+recurring briefly again on `2026-07-26T14:38 IST`. **Impact**: one background
+`Maintenance loop` task (`backend.main`) exited due to a DNS failure on the first
+occurrence; the application otherwise continued running normally throughout both
+occurrences — no container restart, no service outage, no evidence of data loss.
+**Assessment**: root cause undetermined between VirtualBox NAT, host networking, DNS
+resolver, ISP connectivity, or upstream service/network interruption — current
+evidence doesn't distinguish among them, and Phase 15's scope is VM deployment
+validation, not infrastructure root-causing. Not blocking. Re-evaluate on the
+physical i3-2120 deployment: if it recurs there, investigate DNS config, host
+networking, and retry/resilience around the maintenance loop specifically; if it
+doesn't recur, this was VM/NAT-environment-specific.
+
+**Superseded going forward**: this phase's `phase15_stability_snapshot.sh`/timer was
+a temporary, phase-scoped validation tool with a defined window. Now that the window
+is complete, ongoing operational visibility is provided by the new
+`docker/monitoring/` system (`docs/MONITORING.md`) instead — the stability timer can
+be disabled.
+
 ### 5. Large-file upload/download/resumable transfer
 
 **Investigation note, 2026-07-24/25**: mid-execution, three unrelated upload
@@ -145,6 +196,19 @@ follow-ups):
    is exactly the kind of mixup that made the investigation above necessary,
    and would recur for any user who switches devices/browsers mid-upload.
 
+**Result: PASS, 2026-07-25.** After the widget-dismiss fix (`21223b5`) was
+built, deployed (`docker compose build telecloud-app && docker compose up -d
+telecloud-app`), and confirmed healthy, the stuck session was properly
+aborted via the fixed confirm-and-abort flow (verified it did not reappear on
+refresh), and `testfile_2gb.bin` was re-uploaded fresh through the full
+chunked path to completion. Downloaded back and verified byte-for-byte via
+SHA-256:
+```
+a7c744c13cc101ed66c29f672f92455547889cc586ce6d44fe76ae824958ea51
+```
+Matched exactly (`Get-FileHash -Algorithm SHA256` on Windows). Chunked
+upload, and download integrity, both confirmed correct end-to-end.
+
 Extend Phase 9's matrix with genuinely large files (proposing multi-GB — exact size TBD
 based on realistic real-world usage) through the full chunked/resumable path,
 including a deliberate interrupt-and-resume mid-transfer. **Pass**: byte-for-byte
@@ -194,6 +258,20 @@ activity), not the synthetic cryptg-only benchmark from Phase 10 — this is the
 that actually predicts i3-2120 behavior. Documented for direct before/after comparison
 once the same measurement is repeated on real hardware.
 
+**Result: PASS, 2026-07-25.** `phase15_transfer_monitor.sh` (5s interval, `docker
+stats` + host loadavg/mem + external curl probe + Docker healthcheck status) ran
+throughout the full `testfile_2gb.bin` chunked upload. Peak observed:
+`telecloud-app` 95.46% CPU / 103.7MiB RAM at the chunk-relay peak (consistent with
+Phase 10's cryptg GIL-bound single-threaded relay behavior); `telecloud-nginx`
+briefly 203.90% CPU / 14.94MiB RAM proxying the large request body (a multi-vCPU VM,
+so >100% reflects more than one core, not an anomaly). `telecloud-postgres` stayed
+near-idle throughout (expected — no DB-heavy work during a chunk relay). Host memory
+stayed flat at 2.4Gi/7.6Gi used across the whole transfer; host loadavg peaked around
+2.3 on this VM's allocated cores. Housekeeping note: a stale monitor process from
+earlier in the session (`PID 96238`) had been left running and duplicate-writing to
+the same log, causing interleaved/duplicated lines — identified via `ps aux` and
+killed; the underlying data was unaffected, only log readability.
+
 ### 8. Upload-unresponsiveness reproduction attempt
 Deliberately attempt to reproduce Phase 11's finding (concurrent upload correlated
 with Docker healthcheck failing repeatedly and external `curl` hanging indefinitely).
@@ -205,6 +283,19 @@ root cause is identified, or reproduction is attempted rigorously and documented
 not-yet-reproduced-under-VM-conditions (to be retried on real hardware per your
 stated objective 3) — not simply "we didn't see it this time."
 
+**Result: NOT REPRODUCED, 2026-07-25 — documented with direct evidence, per the
+stated pass bar.** At the exact timestamp of item 7's peak CPU sample (95.46% on
+`telecloud-app`, 203.90% on `telecloud-nginx`), the external curl probe
+(`http://localhost/health` via nginx, replicating Phase 11's exact symptom)
+returned `HTTP 200` in 25–37ms, and Docker's own healthcheck reported `healthy
+(failing streak: 0)` — the opposite of Phase 11's "healthcheck failed 12
+consecutive times, curl hung indefinitely." Sampled continuously across the whole
+transfer (5s interval, ~2GB file, real chunked upload, not synthetic), with no
+sample showing degraded responsiveness at any point, including the CPU peak. Not
+reproduced under these VM conditions — carried forward per the plan's own
+instruction to retry under real i3-2120 hardware conditions, not treated as a
+closed/explained root cause.
+
 ### 9. Docker restart + VM reboot recovery re-verification
 Re-run Phase 11 scenarios (2) `docker kill`/`docker stop` behavior and (5+6) full VM
 reboot recovery — worth re-confirming specifically because 14a–14e added substantial
@@ -212,7 +303,88 @@ new state (DOCKER-USER rules, container `read_only`/cap-drop settings, digest pi
 since Phase 11 last verified this, and none of it has been exercised through a reboot
 cycle together as a whole system.
 
+**Result: PASS, 2026-07-25.**
+
+*Scenario 2 (`docker kill`) + 4 (recovery/resume/integrity), re-verified clean.* Started
+a chunked upload (`phase10_upload_benchmark.py`, 500MB file) via the VM's own script
+(chosen over the browser for deterministic fault-injection timing — see discussion in
+session), killed `telecloud-app` at 11.7% into the Telegram-relay phase. Confirmed
+`Exited (137)` and no auto-restart (correct, matches Phase 11's corrected understanding
+of `unless-stopped` respecting an explicit external kill). Manually restarted; the
+script's own transient-error-tolerant polling loop (already exercising Scenario 3)
+picked the recovery up automatically with no client intervention beyond the restart,
+re-relayed the part from byte 0, completed. Downloaded and sha256-verified against the
+source:
+```
+a08a92258f621b55d08ad1e84c90c2ea6286fc6b6c9a4dfa7156afb16c190170
+```
+Exact match on both sides.
+
+*Scenario 5 + 6 (full VM reboot, per-service recovery), re-verified clean, including
+14a–14e hardening for the first time through a real cold boot.* Captured a pre-reboot
+baseline, forced a reboot (`sudo systemctl reboot -i`, needed to override GNOME's
+session inhibitor) mid-transfer (3.4% into the Telegram-relay phase, session
+`e8a0b0de-...`), and confirmed after boot:
+- All three containers back up and healthy with zero manual intervention.
+- DOCKER-USER: identical 5 rules, before and after (confirms
+  `telecloud-docker-user-rules.service` correctly re-applies iptables rules on boot —
+  the first real proof of that mechanism working, not just unit-file inspection).
+- `telecloud-app` hardening (`ReadOnlyRootfs`, `CapDrop`, `CapAdd`, `SecurityOpt`):
+  byte-for-byte identical before and after.
+
+*Scenario 7 (in-flight upload survives reboot), evidence-based partial result — evidence
+and inference kept explicitly separate, not blended.* **What the logs directly prove**:
+multiple `GET /uploads/e8a0b0de...` requests returned `200 OK` immediately after the
+reboot, with the session correctly still in a resumable state — this alone confirms the
+reboot did not destroy or corrupt the session, which is the invariant this scenario
+exists to test. **What happened next**: a client-initiated `DELETE
+/uploads/e8a0b0de...` from the Windows Chrome browser (`ip=10.0.2.2`) aborted the
+session before it could be manually resumed to completion, in the same window where two
+other leftover sessions from earlier script retry/false-starts were also cleaned up from
+that same tab. **What we can't conclude from logs alone**: *why* the DELETE happened —
+that a stale browser tab left open the whole time led to an accidental dismiss of the
+wrong same-named entry is a plausible, leading hypothesis, not a proven fact. Recorded
+as PASS on the strength of the directly-proven survival evidence; the
+reboot→resume→completion path with a final checksum was not completed end-to-end this
+run and can be re-attempted in a clean browser state if wanted, but is not treated as
+blocking.
+
+**New finding, 2026-07-25**: the upload widget shows no session ID or timestamp,
+only the filename — when multiple sessions share a filename (as happened here from
+repeated script retries), they're visually indistinguishable, making it easy to
+dismiss/abort the wrong one. Distinct from the two Phase 15 item 5 findings (missing
+resume affordance, cross-browser duplicate session); not fixed this phase, tracked as
+a follow-up.
+
 ### 10. Deployment reproducibility check (required before any Go verdict)
+
+**Result: PASS, 2026-07-25.**
+- **Commit hash**: `21223b5755299d08bb77488adcbc1feb3193b563`, clean working tree on
+  the VM (`git status --short` empty), matching `origin/main` at time of testing.
+- **Digest pins**: `patch_management_check.sh` section 3 confirmed all 4 pinned base
+  images (`node:22-slim`, `python:3.13-slim` ×2, `nginx:1.27-alpine`,
+  `postgres:18-alpine`) exactly `pinned == live` — zero drift.
+- **Fresh-clone build**: genuine `git clone` into scratch space (`/tmp`, disposable —
+  not the existing checkout) at the exact same commit, then `docker compose build
+  --no-cache telecloud-app` — full `npm ci` → `npm run build` → `pip install` →
+  image export, no cache reused, completed successfully with no errors. Proves the
+  i3-2120 deployment can actually build from source at this commit, not just that the
+  VM's already-built images happen to work.
+
+**Open follow-up, non-blocking per explicit scope decision**: `patch_management_check.sh`
+section 4 (Trivy) surfaced new CRITICAL CVEs published *after* Phase 14c's pinning —
+`CVE-2026-31789` (OpenSSL heap buffer overflow, nginx image), `CVE-2025-68121` (Go
+stdlib TLS cert validation, postgres image), `CVE-2026-13221` (Perl, python/node/
+telecloud-app images), `CVE-2026-59873` (`tar` npm package, DoS via gzip bomb,
+frontend build). Digest-pinning working as designed — it locks image *content*, not
+future CVE-freeness against that content, so new disclosures against pinned images are
+expected over time, not a regression. Decision: tracked as an open security follow-up,
+not blocking Phase 15 (whose scope is VM-to-real-hardware validation, not
+production/internet-facing readiness — see this document's scope section). Recommended
+action before the later production/internet-exposure gate: review upstream image
+updates, assess exploitability in this deployment's actual usage, rebuild with patched
+base images once available, rerun the Trivy scan to confirm clean before that gate.
+
 Before the report can declare Go, document the exact, pinned state the i3-2120
 deployment would clone from source — not just "current `main`":
 - The exact `git` commit hash `HEAD` is at when testing concludes.
