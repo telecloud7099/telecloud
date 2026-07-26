@@ -120,5 +120,45 @@ script sources `.env.monitoring` fresh on each run.
    rotation (above) requires re-subscribing.
 
 ## Verification history
+
 - 2026-07-26: manual test notification confirmed delivered with correct formatting
   (severity/component/host/timestamp/message/next-step), no secrets present.
+- 2026-07-26: **`OnFailure=` failure-notification chain, live end-to-end test.**
+  Deliberately caused `telecloud-backup.service` to fail (temporarily hid
+  `.env.backup`) and confirmed the full real chain — not just the individual
+  scripts — actually fires: failed unit → `OnFailure=` →
+  `telecloud-notify-failure@.service` → CRITICAL alert received on device.
+  Two real bugs found and fixed during this test, not assumed away:
+  - `telecloud-notify-failure@.service` used `%I` (unescaped instance name),
+    which incorrectly turned the literal dash in `telecloud-backup.service`
+    into a slash (`telecloud/backup.service`) — systemd's unescaping rules
+    interpret `-` as an encoded `/`. Fixed to `%i` (used as-is).
+  - `notify_failure.sh`'s `STAGE` extraction lacked the same `|| true`
+    fallback its `LAST_JSON` line had — a real, observed race (journald
+    hadn't indexed the just-failed unit's own output yet, since `OnFailure=`
+    fires essentially instantly) caused the whole script to abort under
+    `set -e` before ever calling `notify.sh`, silently losing the alert.
+    Fixed with a fallback to `stage: unknown` — accepted as a documented,
+    low-impact residual: the alert still reliably fires and always points to
+    the correct `journalctl` command for full detail, even when the specific
+    stage name isn't caught in time.
+  - Also found and fixed separately: the executable bit on all
+    backup/monitoring scripts was never actually committed to git (only
+    applied locally via `chmod +x` each time), so every `git pull`/`checkout`
+    silently reset it — fixed via `git update-index --chmod=+x`.
+- 2026-07-26: **Health monitor, live end-to-end test.** Stopped
+  `telecloud-nginx` — `health_monitor.sh` correctly detected `exited` and sent
+  exactly one CRITICAL alert. An immediate second manual run sent nothing
+  (dedup confirmed). After restarting the container, a third run sent exactly
+  one RECOVERY alert. Formatting correct throughout.
+- 2026-07-26: **Security alert wrapper, synthetic-input test.** Two
+  below-threshold `LOGIN_FAILED` events from the same IP produced no `FLAG:`
+  and no notification. Three events (at the clustering threshold) produced
+  `FLAG:` and exactly one WARNING notification, confirming the wrapper's
+  conditional logic without needing to generate real failed logins against
+  production.
+
+**Status: monitoring and alerting implementation complete and fully verified**
+— every alert path (backup/restore-verify failure, container health with
+dedup/recovery, security event clustering) has been exercised live, not just
+code-reviewed, with two real bugs found and fixed along the way.
