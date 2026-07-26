@@ -82,10 +82,12 @@ Full narrative, evidence, and exact commands for every area: `docs/PHASE15_GO_NO
   conditions despite deliberately attempting to, with direct evidence (curl-probe
   timing at the exact CPU peak) — not simply "we didn't see it." Retry on the
   i3-2120 per the original resilience test plan's own stated objective.
-- **Item 10**: four CVEs from the monthly Trivy scan, each individually assessed and
-  documented as not-exploitable-in-current-usage (`SECURITY_NOTES.md` §6a) — not
-  remediated, since digest-pinning intentionally locks content, not future
-  CVE-freeness. Re-reviewed on the same monthly cadence as the pinned-image check.
+- **Item 10**: five CRITICAL-severity CVEs from the monthly Trivy scan, each
+  individually assessed and documented as not-exploitable-in-current-usage
+  (`SECURITY_NOTES.md` §6a) — not remediated, since digest-pinning intentionally
+  locks content, not future CVE-freeness. Re-reviewed on the same monthly cadence as
+  the pinned-image check. (A 5th, `CVE-2023-45853`, was found and corrected during
+  the subsequent Internet Exposure audit — see that document.)
 
 ## What this verdict does NOT cover
 

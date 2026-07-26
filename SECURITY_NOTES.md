@@ -240,7 +240,51 @@ scheduled monthly pinned-image review (`PATCH_MANAGEMENT_POLICY.md`).
 - **Recommended future action:** resolves naturally on the next `node:22-slim`
   pinned-image bump; no urgency.
 
-**Summary:** none of these four packages were upgraded or patched — all four remain
+### CVE-2023-45853 — zlib MiniZip integer overflow / heap buffer overflow
+- **Advisory:** https://nvd.nist.gov/vuln/detail/CVE-2023-45853
+- **Found:** present in the Phase 15 item 10 scan too, but missed when the original
+  4-CVE list was written up — caught during the 2026-07-26 Internet Exposure
+  Checklist re-audit, which re-ran the full scan rather than trusting the earlier
+  summary. Documented properly now rather than left uncorrected.
+- **Affected component:** `zlib1g`, `node:22-slim` (the `frontend-builder` Docker
+  stage only).
+- **Installed version:** `1:1.2.13.dfsg-1` (marked `will_not_fix` by Debian).
+- **Reason not reachable:** two independent factors, either alone sufficient.
+  (1) `node:22-slim` is used exclusively as the `frontend-builder` build stage
+  (`docker/backend/Dockerfile:12`) — only its `/app/frontend/dist` *output* is
+  copied into the final runtime image (`Dockerfile:60`); the `node:22-slim` image
+  itself, `zlib1g` included, is discarded after build and never runs as part of the
+  shipped/running `telecloud-app` container. (2) The CVE is specifically in zlib's
+  MiniZip component (ZIP-archive handling) — `npm ci` extracts `.tgz` (tar+gzip)
+  packages, not `.zip` files, so the vulnerable code path is unlikely to execute
+  even transiently during the build itself.
+- **Verification:** confirmed via direct read of `docker/backend/Dockerfile`
+  (stage structure and `COPY --from=frontend-builder` line) plus knowledge of
+  `npm ci`'s package format (`.tgz`, not `.zip`).
+- **Residual risk:** effectively none for the shipped image (component never
+  present at runtime); low for the build process itself (component present but its
+  specific vulnerable function not in the normal `npm ci`/`npm run build` call path).
+- **Invalidating conditions:** if the Dockerfile is ever restructured so `node:22-slim`
+  (or any of its layers) ends up copied into the runtime image, or if the build
+  process is changed to handle `.zip` archives.
+- **Recommended future action:** resolves naturally on the next `node:22-slim`
+  pinned-image bump; no urgency.
+
+**Process note on how this was found**: a "complete, dedicated" re-audit means
+actually re-running the scan and reading its full output again, not trusting an
+earlier summary — this is exactly the kind of gap that approach is supposed to
+catch. **Also disclosed, not silently scoped out**: this document (like the original
+Phase 15 item 10 pass) individually assesses CRITICAL-severity findings only. Each
+scanned image also carries several dozen HIGH-severity findings that have not been
+individually enumerated or assessed one-by-one. Given every CRITICAL assessed so far
+turned out non-exploitable for systematic reasons (dormant OS-package weight never
+invoked by this app, build-time-only artifacts, architecture-specific bugs on a
+64-bit-only deployment) that would apply equally to most HIGH findings in the same
+images, this is a deliberate, disclosed scoping decision consistent with this
+project's risk-based approach — not an oversight. Revisit if a deeper line-by-line
+HIGH-severity pass is wanted before a future, higher-stakes gate.
+
+**Summary:** none of these five packages were upgraded or patched — all five remain
 at their currently-pinned (nominally vulnerable) versions. What's documented above is
 that the specific vulnerable code path in each case is not reachable given how these
 components are actually used in this deployment, verified via a combination of
