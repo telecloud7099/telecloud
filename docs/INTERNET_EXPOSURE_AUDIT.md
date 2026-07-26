@@ -11,12 +11,11 @@ requirement. This is separate from, and a strictly higher bar than,
 Tunnel, port-forward, or any other means — until every item below is satisfied.**
 This is a hard gate per `SECURITY_ARCHITECTURE.md` §4, not a best-effort list.
 
-## Verdict: **NO-GO — 3 items remaining, all already scheduled next**
+## Verdict: **NO-GO — 2 items remaining, both already scheduled next**
 
-12 of 15 items are satisfied. The 3 outstanding items are exactly the next three
-steps you've already planned (VM end-to-end testing, then Cloudflare Tunnel) — this
-audit confirms that sequence is correct and complete, not that anything new is
-missing.
+13 of 15 items are now satisfied (item 14 closed 2026-07-26). The 2 outstanding items
+are TLS/Tunnel configuration (items 2 + 5, one piece of work) and the final re-audit
+(item 15) — exactly the sequence you've already planned.
 
 ## Item-by-item status
 
@@ -35,7 +34,7 @@ missing.
 | 11 | Images digest-pinned and scanned, no outstanding Critical/High CVEs | ✅ **DONE** (as documented risk assessments) | Phase 14c pinning, confirmed `pinned == live` with zero drift as of this audit. 5 CRITICAL-severity CVEs from the monthly Trivy scan each individually investigated and documented as not-exploitable-in-current-usage, with verification method, residual risk, and invalidating conditions (`SECURITY_NOTES.md` §6a) — not remediated (versions unchanged), satisfying this item's explicit "or documented evidence... not exploitable" allowance. The 5th (`CVE-2023-45853`, zlib) was found during this audit's re-scan, having been missed in the original pass — corrected, not left uncorrected. HIGH-severity findings (several dozen per image) are deliberately not individually enumerated, a disclosed scoping decision explained in `SECURITY_NOTES.md` §6a, not an oversight. |
 | 12 | Automatic security updates on host OS | ✅ **DONE** | Phase 14e (`unattended-upgrades`, extended to Docker Engine's own repo). |
 | 13 | Monitoring/alerting active for suspicious logins and resource anomalies | ✅ **DONE** | Phase 15 (this session): backup/restore-verify failures, container health (with dedup + recovery notifications), and security-event clustering all alert automatically via ntfy.sh. All three paths live-tested end-to-end, two real bugs found and fixed during testing (`docs/MONITORING.md`). |
-| 14 | Full functional test matrix passes against the *exact* configuration being exposed | ❌ **NOT DONE** | Phase 9/15's functional matrix has been re-run before, but not against *this* exact commit — which now includes the sandbox hardening, the widget dismiss fix, and the entire backup/monitoring system added since the last full run. This is your planned "VM end-to-end testing" next step. |
+| 14 | Full functional test matrix passes against the *exact* configuration being exposed | ✅ **DONE** | Re-run 2026-07-26 against commit `8efd733`, all 8 items PASS (`docs/FUNCTIONAL_TEST_MATRIX.md`). Surfaced and resolved a real hygiene issue along the way: accumulated Phase 15 test artifacts causing 22 console 404s — cleaned via the app's own delete API, re-verified clean afterward with a fresh upload/thumbnail/download cycle. |
 | 15 | Complete dedicated security audit performed immediately before go-live | ⏳ **THIS DOCUMENT** | In progress — see verdict above. Must be re-run (or explicitly re-confirmed) after items 2, 5, and 14 close, since this audit's own standard requires checking actual current state, not memory of an earlier pass. |
 
 ## What "already satisfied" means here, precisely
