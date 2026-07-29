@@ -72,13 +72,19 @@ cat "$RUN_DIR/environment.json"
 # ── Resource monitor (continuous for the whole run, raw output kept) ───────
 start_monitor() {
   local name="$1"
+  # The trailing `> /dev/null 2>&1` on the backgrounded subshell itself (not
+  # just the loop body's per-iteration redirect) is required, not cosmetic:
+  # this function is called via `mon_pid=$(start_monitor ...)`, and without
+  # it, the infinite loop inherits the command-substitution's output pipe
+  # and holds it open forever, which hangs `$(...)` indefinitely waiting for
+  # EOF that never comes -- reproduced live, not theoretical.
   ( while true; do
       { echo "--- $(date -Iseconds) ---"
         docker stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}'
         echo -n "host loadavg: "; cat /proc/loadavg
       } >> "$RAW_DIR/${name}_resources.log" 2>&1
       sleep 5
-    done ) &
+    done ) > /dev/null 2>&1 &
   echo $!
 }
 
