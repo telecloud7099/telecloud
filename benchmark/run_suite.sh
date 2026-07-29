@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
-# run_suite.sh <label> <token> [range_start] [range_end]
+# run_suite.sh <label> <token> [sizes_gb] [range_start] [range_end]
 #
 # Generic transfer-performance benchmark suite -- not specific to any one
-# change. Captures exact environment metadata, runs 2GB + 10GB upload/
-# download timing, a resume-after-interruption test, a Range-request test,
-# resource monitoring throughout, and a FloodWaitError log check. Saves all
-# raw data (not just summaries) so results are independently reviewable and
-# reproducible. Run once per configuration being compared (e.g. once on
-# `main`, once on a change branch), same VM, same day -- see compare.sh to
-# diff two runs afterward.
+# change. Captures exact environment metadata, runs upload/download timing
+# for each requested file size, a resume-after-interruption test, a
+# Range-request test, resource monitoring throughout, and a FloodWaitError
+# log check. Saves all raw data (not just summaries) so results are
+# independently reviewable and reproducible. Run once per configuration
+# being compared (e.g. once on `main`, once on a change branch), same VM,
+# same day -- see compare.py to diff two runs afterward.
 #
+# sizes_gb: space-separated list of file sizes in GB to test, default "2".
+# Pass e.g. "2 10" for a larger stress-test pass later.
 # range_start/range_end default to a range spanning 83886080 bytes (80MB),
 # a value relevant to the chunk-size change this suite was first built for;
-# pass different values for other purposes.
+# pass different values for other purposes. The Range test runs against the
+# largest size in sizes_gb.
 set -uo pipefail
 
-LABEL="${1:?Usage: $0 <label> <token> [range_start] [range_end]}"
-TOKEN="${2:?Usage: $0 <label> <token> [range_start] [range_end]}"
-RANGE_START="${3:-83886000}"
-RANGE_END="${4:-83886200}"
+LABEL="${1:?Usage: $0 <label> <token> [sizes_gb] [range_start] [range_end]}"
+TOKEN="${2:?Usage: $0 <label> <token> [sizes_gb] [range_start] [range_end]}"
+SIZES_GB="${3:-2}"
+RANGE_START="${4:-83886000}"
+RANGE_END="${5:-83886200}"
 
 APP_DIR="/opt/telecloud/app"
 BENCH_ROOT="/opt/telecloud/bench"
@@ -45,6 +49,7 @@ cd "$APP_DIR"
   echo "  \"app_image_id\": \"$(docker inspect telecloud-app --format '{{.Image}}' 2>/dev/null)\","
   echo "  \"host_cpus\": $(nproc),"
   echo "  \"host_mem_total\": \"$(free -h | awk 'NR==2{print $2}')\","
+  echo "  \"sizes_gb\": \"$SIZES_GB\","
   echo "  \"range_test_bytes\": \"${RANGE_START}-${RANGE_END}\""
   echo "}"
 } > "$RUN_DIR/environment.json"
@@ -102,30 +107,41 @@ run_transfer() {
   echo "$file_id"
 }
 
-fallocate -l 2G "$BENCH_ROOT/test_2gb.bin"
-FILE_ID_2GB=$(run_transfer "2gb" "$BENCH_ROOT/test_2gb.bin")
+LARGEST_GB=0
+LARGEST_FILE_ID=""
+LARGEST_FILE_PATH=""
+FILE_IDS=""
+for gb in $SIZES_GB; do
+  size_label="${gb}gb"
+  file_path="$BENCH_ROOT/test_${size_label}.bin"
+  fallocate -l "${gb}G" "$file_path"
+  file_id=$(run_transfer "$size_label" "$file_path")
+  FILE_IDS="$FILE_IDS $size_label=$file_id"
+  if [ "$gb" -ge "$LARGEST_GB" ]; then
+    LARGEST_GB="$gb"
+    LARGEST_FILE_ID="$file_id"
+    LARGEST_FILE_PATH="$file_path"
+  fi
+done
 
-fallocate -l 10G "$BENCH_ROOT/test_10gb.bin"
-FILE_ID_10GB=$(run_transfer "10gb" "$BENCH_ROOT/test_10gb.bin")
-
-# ── 3. Range request ────────────────────────────────────────────────────────
+# ── 3. Range request (against the largest size tested) ─────────────────────
 log "--- Range request test ---"
-if [ -n "$FILE_ID_10GB" ]; then
+if [ -n "$LARGEST_FILE_ID" ]; then
   curl -s -o /dev/null -D "$RAW_DIR/range_test_headers.txt" \
     -w "http_code=%{http_code} time_total=%{time_total} size_download=%{size_download}\n" \
     -H "Authorization: Bearer $TOKEN" -H "Range: bytes=${RANGE_START}-${RANGE_END}" \
-    "http://localhost/file/$FILE_ID_10GB" > "$RAW_DIR/range_test_timing.txt" 2>&1
+    "http://localhost/file/$LARGEST_FILE_ID" > "$RAW_DIR/range_test_timing.txt" 2>&1
   cat "$RAW_DIR/range_test_timing.txt"
   RANGE_CODE=$(grep -oE 'http_code=[0-9]+' "$RAW_DIR/range_test_timing.txt" | cut -d= -f2)
   [ "$RANGE_CODE" = "206" ] || anomaly "range" "expected HTTP 206, got $RANGE_CODE"
 else
-  anomaly "range" "skipped -- no 10gb file_id available"
+  anomaly "range" "skipped -- no file_id available to test against"
 fi
 
-# ── 4. Resume-after-interruption ────────────────────────────────────────────
+# ── 4. Resume-after-interruption (against the largest size tested) ─────────
 log "--- Resume-after-interruption test ---"
 RESUME_LOG="$RAW_DIR/resume_upload.log"
-python3 phase10_upload_benchmark.py "$BENCH_ROOT/test_2gb.bin" --label "${LABEL}-resume" --token "$TOKEN" > "$RESUME_LOG" 2>&1 &
+python3 phase10_upload_benchmark.py "$LARGEST_FILE_PATH" --label "${LABEL}-resume" --token "$TOKEN" > "$RESUME_LOG" 2>&1 &
 RESUME_PID=$!
 sleep 8
 if ! kill -0 "$RESUME_PID" 2>/dev/null; then
@@ -155,14 +171,15 @@ FLOOD_COUNT=$(wc -l < "$FLOOD_LOG")
 {
   echo "{"
   echo "  \"label\": \"$LABEL\","
-  echo "  \"file_id_2gb\": \"$FILE_ID_2GB\","
-  echo "  \"file_id_10gb\": \"$FILE_ID_10GB\","
+  echo "  \"file_ids\": \"$(echo "$FILE_IDS" | sed 's/^ //')\","
   echo "  \"flood_wait_error_count\": $FLOOD_COUNT,"
   echo "  \"anomaly_count\": $(wc -l < "$ANOMALY_LOG")"
   echo "}"
 } > "$SUMMARY"
 
-rm -f "$BENCH_ROOT/test_2gb.bin" "$BENCH_ROOT/test_10gb.bin"
+for gb in $SIZES_GB; do
+  rm -f "$BENCH_ROOT/test_${gb}gb.bin"
+done
 
 log "===== Run complete: $LABEL ====="
 log "Raw data: $RAW_DIR"

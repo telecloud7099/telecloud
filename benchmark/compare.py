@@ -82,6 +82,20 @@ def fmt_metric(name: str, before: dict, after: dict, key: str, unit: str, lower_
     return f"  {name}: before={b:.3f}{unit} after={a:.3f}{unit} diff={diff:+.1f}% ({direction}){flag}"
 
 
+def discover_size_labels(before_dir: Path, after_dir: Path) -> list[str]:
+    """Auto-discovers which sizes were actually tested (e.g. just "2gb", or
+    "2gb"+"10gb") from whichever run has raw upload logs, rather than
+    hardcoding a fixed list -- run_suite.sh's sizes_gb argument is variable."""
+    labels = set()
+    for d in (before_dir, after_dir):
+        raw = d / "raw"
+        if raw.exists():
+            for p in raw.glob("*_upload.log"):
+                if not p.name.startswith("resume"):
+                    labels.add(p.name.removesuffix("_upload.log"))
+    return sorted(labels, key=lambda s: int(s.replace("gb", "") or 0))
+
+
 def main():
     if len(sys.argv) != 3:
         sys.exit("Usage: compare.py <before_run_dir> <after_run_dir>")
@@ -111,7 +125,7 @@ def main():
         for a in after_anomalies:
             print(f"    {a}")
 
-    for size_label in ("2gb", "10gb"):
+    for size_label in discover_size_labels(before_dir, after_dir):
         print(f"\n--- {size_label.upper()} transfer ---")
         up_before = parse_upload_log(before_dir, size_label)
         up_after = parse_upload_log(after_dir, size_label)
