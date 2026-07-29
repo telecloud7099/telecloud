@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_suite.sh <label> <token> [sizes_gb] [range_start] [range_end]
+# TELECLOUD_JWT=<token> run_suite.sh <label> [sizes_gb] [range_start] [range_end]
 #
 # Generic transfer-performance benchmark suite -- not specific to any one
 # change. Captures exact environment metadata, runs upload/download timing
@@ -10,6 +10,12 @@
 # being compared (e.g. once on `main`, once on a change branch), same VM,
 # same day -- see compare.py to diff two runs afterward.
 #
+# The auth token is read ONLY from the TELECLOUD_JWT environment variable,
+# never as a CLI argument -- a positional argument would land in this
+# process's argv, visible to any local user via `ps aux` (confirmed the hard
+# way: it leaked into a shared terminal transcript this way). An env var set
+# via `export` doesn't appear in `ps aux`.
+#
 # sizes_gb: space-separated list of file sizes in GB to test, default "2".
 # Pass e.g. "2 10" for a larger stress-test pass later.
 # range_start/range_end default to a range spanning 83886080 bytes (80MB),
@@ -18,11 +24,19 @@
 # largest size in sizes_gb.
 set -uo pipefail
 
-LABEL="${1:?Usage: $0 <label> <token> [sizes_gb] [range_start] [range_end]}"
-TOKEN="${2:?Usage: $0 <label> <token> [sizes_gb] [range_start] [range_end]}"
-SIZES_GB="${3:-2}"
-RANGE_START="${4:-83886000}"
-RANGE_END="${5:-83886200}"
+LABEL="${1:?Usage: TELECLOUD_JWT=<token> $0 <label> [sizes_gb] [range_start] [range_end]}"
+TOKEN="${TELECLOUD_JWT:?TELECLOUD_JWT env var must be set (never pass the token as a CLI argument)}"
+SIZES_GB="${2:-2}"
+RANGE_START="${3:-83886000}"
+RANGE_END="${4:-83886200}"
+
+# curl's -H puts the header value in curl's own argv (briefly visible via `ps
+# aux` while that curl call runs) -- routed through a private config file
+# instead, same reasoning as TOKEN being env-var-only above.
+AUTH_CONF=$(mktemp)
+chmod 600 "$AUTH_CONF"
+echo "header = \"Authorization: Bearer $TOKEN\"" > "$AUTH_CONF"
+trap 'rm -f "$AUTH_CONF"' EXIT
 
 APP_DIR="/opt/telecloud/app"
 BENCH_ROOT="/opt/telecloud/bench"
@@ -75,7 +89,7 @@ run_transfer() {
   local mon_pid; mon_pid=$(start_monitor "$size_label")
 
   local up_log="$RAW_DIR/${size_label}_upload.log"
-  python3 phase10_upload_benchmark.py "$file_path" --label "${LABEL}-${size_label}" --token "$TOKEN" > "$up_log" 2>&1
+  TELECLOUD_JWT="$TOKEN" python3 phase10_upload_benchmark.py "$file_path" --label "${LABEL}-${size_label}" > "$up_log" 2>&1
   local up_status=$?
   local file_id; file_id=$(grep -oE 'file_id: [a-f0-9-]+' "$up_log" | head -1 | cut -d' ' -f2)
 
@@ -89,7 +103,7 @@ run_transfer() {
 
   local dl_path="$RAW_DIR/${size_label}_downloaded.bin"
   local dl_timing="$RAW_DIR/${size_label}_download_timing.txt"
-  curl -s -H "Authorization: Bearer $TOKEN" \
+  curl -s -K "$AUTH_CONF" \
     -w "http_code=%{http_code} time_total=%{time_total} time_starttransfer=%{time_starttransfer} speed_download=%{speed_download} size_download=%{size_download}\n" \
     "http://localhost/file/$file_id?download=true" -o "$dl_path" > "$dl_timing" 2>&1
   cat "$dl_timing"
@@ -129,7 +143,7 @@ log "--- Range request test ---"
 if [ -n "$LARGEST_FILE_ID" ]; then
   curl -s -o /dev/null -D "$RAW_DIR/range_test_headers.txt" \
     -w "http_code=%{http_code} time_total=%{time_total} size_download=%{size_download}\n" \
-    -H "Authorization: Bearer $TOKEN" -H "Range: bytes=${RANGE_START}-${RANGE_END}" \
+    -K "$AUTH_CONF" -H "Range: bytes=${RANGE_START}-${RANGE_END}" \
     "http://localhost/file/$LARGEST_FILE_ID" > "$RAW_DIR/range_test_timing.txt" 2>&1
   cat "$RAW_DIR/range_test_timing.txt"
   RANGE_CODE=$(grep -oE 'http_code=[0-9]+' "$RAW_DIR/range_test_timing.txt" | cut -d= -f2)
@@ -141,7 +155,7 @@ fi
 # ── 4. Resume-after-interruption (against the largest size tested) ─────────
 log "--- Resume-after-interruption test ---"
 RESUME_LOG="$RAW_DIR/resume_upload.log"
-python3 phase10_upload_benchmark.py "$LARGEST_FILE_PATH" --label "${LABEL}-resume" --token "$TOKEN" > "$RESUME_LOG" 2>&1 &
+TELECLOUD_JWT="$TOKEN" python3 phase10_upload_benchmark.py "$LARGEST_FILE_PATH" --label "${LABEL}-resume" > "$RESUME_LOG" 2>&1 &
 RESUME_PID=$!
 sleep 8
 if ! kill -0 "$RESUME_PID" 2>/dev/null; then
