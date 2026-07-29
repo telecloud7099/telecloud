@@ -20,10 +20,20 @@ from backend.database import (
 
 logger = logging.getLogger(__name__)
 
-# Kept comfortably under Telegram's own 2 GiB / 4 GiB per-document cap to leave margin
-# for protocol overhead.
-FREE_CHUNK_SIZE = 1900 * 1024 * 1024
-PREMIUM_CHUNK_SIZE = 3900 * 1024 * 1024
+# Sized for Cloudflare Tunnel compatibility, not Telegram's own per-document cap (2 GiB /
+# 4 GiB) -- Cloudflare's proxy enforces a 100MB request-body limit on Free/Pro plans, and
+# that applies to all Tunnel traffic (Quick or Named) with no bypass, since Tunnel traffic
+# is always proxied. 80 MiB leaves ~16MB margin under 100MB even if Cloudflare's limit is
+# decimal (100,000,000 bytes) rather than binary -- verified this isn't just caution: a
+# request within a few hundred KB of a decimal 100,000,000-byte cutoff (e.g. 95 MiB =
+# 99,614,720 bytes) would be uncomfortably close given HTTP header overhead. Both free and
+# premium Telegram accounts use the same value now since neither approaches the real
+# constraint (Cloudflare's proxy) anymore -- it was Telegram's cap that motivated two
+# different sizes before. Existing files uploaded at the old, larger sizes remain fully
+# downloadable: the download path reads each chunk's actual recorded size from its own
+# FileChunk row, never this constant (see chunk_download.py's ChunkPlan).
+FREE_CHUNK_SIZE = 80 * 1024 * 1024
+PREMIUM_CHUNK_SIZE = 80 * 1024 * 1024
 
 # Any file at or above this size gets a durable UploadSession — independent of whether it
 # actually needs multiple Telegram documents. Below Telegram's own cap this just means a
