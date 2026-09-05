@@ -20,10 +20,10 @@ from backend.database import (
 
 logger = logging.getLogger(__name__)
 
-# Kept comfortably under Telegram's own 2 GiB / 4 GiB per-document cap to leave margin
-# for protocol overhead.
-FREE_CHUNK_SIZE = 1900 * 1024 * 1024
-PREMIUM_CHUNK_SIZE = 3900 * 1024 * 1024
+# Sized for Cloudflare Tunnel's 100MB request-body limit, not Telegram's own per-document
+# cap -- full rationale, options considered, and why 80MB in docs/UPLOAD_CHUNK_ARCHITECTURE.md.
+FREE_CHUNK_SIZE = 80 * 1024 * 1024
+PREMIUM_CHUNK_SIZE = 80 * 1024 * 1024
 
 # Any file at or above this size gets a durable UploadSession — independent of whether it
 # actually needs multiple Telegram documents. Below Telegram's own cap this just means a
