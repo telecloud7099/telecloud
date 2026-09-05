@@ -48,6 +48,10 @@ SUMMARY="$RUN_DIR/summary.json"
 mkdir -p "$RAW_DIR"
 : > "$ANOMALY_LOG"
 
+# Captured once, used to bound the FloodWaitError log check to this run's
+# actual duration instead of a fixed window -- a slow run can span hours.
+RUN_START_ISO="$(date -Iseconds)"
+
 log() { echo "$(date -Iseconds) $*"; }
 anomaly() { echo "$(date -Iseconds) ANOMALY [$1]: $2" | tee -a "$ANOMALY_LOG"; }
 
@@ -92,7 +96,6 @@ start_monitor() {
 run_transfer() {
   local size_label="$1" file_path="$2"
   log "--- $size_label transfer ---"
-  local mon_pid; mon_pid=$(start_monitor "$size_label")
 
   local up_log="$RAW_DIR/${size_label}_upload.log"
   TELECLOUD_JWT="$TOKEN" python3 phase10_upload_benchmark.py "$file_path" --label "${LABEL}-${size_label}" > "$up_log" 2>&1
@@ -101,7 +104,6 @@ run_transfer() {
 
   if [ "$up_status" -ne 0 ] || [ -z "$file_id" ]; then
     anomaly "$size_label" "upload failed or no file_id produced (exit=$up_status) -- see $up_log"
-    kill "$mon_pid" 2>/dev/null
     echo ""
     return
   fi
@@ -122,7 +124,6 @@ run_transfer() {
   fi
   echo "$size_label checksum_match=$([ "$src_hash" = "$dl_hash" ] && echo true || echo false)" >> "$RUN_DIR/checksums.txt"
 
-  kill "$mon_pid" 2>/dev/null
   rm -f "$dl_path"
   echo "$file_id"
 }
@@ -131,6 +132,12 @@ LARGEST_GB=0
 LARGEST_FILE_ID=""
 LARGEST_FILE_PATH=""
 FILE_IDS=""
+
+# Spans the entire benchmark (upload+download, Range test, resume test) so
+# resource behavior during the resume-after-interruption window is captured
+# too, not just the plain transfer legs.
+MON_PID=$(start_monitor "full_run")
+
 for gb in $SIZES_GB; do
   size_label="${gb}gb"
   file_path="$BENCH_ROOT/test_${size_label}.bin"
@@ -182,7 +189,11 @@ fi
 # ── 5. FloodWaitError check ─────────────────────────────────────────────────
 log "--- FloodWaitError check ---"
 FLOOD_LOG="$RAW_DIR/floodwait_check.log"
-docker compose logs telecloud-app --since 25m > "$RAW_DIR/full_app_logs.log" 2>&1
+# `docker compose logs` has been observed serving stale cached content on
+# this VM for this exact container -- use `docker logs` directly instead,
+# bounded to this run's actual start time (not a fixed window) since a slow
+# run can span hours, not minutes.
+docker logs telecloud-app --since "$RUN_START_ISO" --timestamps > "$RAW_DIR/full_app_logs.log" 2>&1
 grep -i "FloodWaitError" "$RAW_DIR/full_app_logs.log" > "$FLOOD_LOG" || true
 FLOOD_COUNT=$(wc -l < "$FLOOD_LOG")
 [ "$FLOOD_COUNT" -gt 0 ] && anomaly "floodwait" "$FLOOD_COUNT FloodWaitError occurrence(s) found -- see $FLOOD_LOG"
@@ -200,6 +211,8 @@ FLOOD_COUNT=$(wc -l < "$FLOOD_LOG")
 for gb in $SIZES_GB; do
   rm -f "$BENCH_ROOT/test_${gb}gb.bin"
 done
+
+kill "$MON_PID" 2>/dev/null
 
 log "===== Run complete: $LABEL ====="
 log "Raw data: $RAW_DIR"
